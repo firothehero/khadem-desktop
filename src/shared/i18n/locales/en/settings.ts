@@ -13,6 +13,7 @@ export default {
   },
   language: {
     label: "Language",
+    arabic: "Arabic",
     english: "English",
     indonesian: "Bahasa Indonesia",
     japanese: "日本語",

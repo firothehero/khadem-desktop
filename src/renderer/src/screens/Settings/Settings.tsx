@@ -15,6 +15,7 @@ import {
 const TELEGRAM_COMMUNITY_URL = "https://t.me/hermes_agent_desktop";
 
 const LANGUAGE_NATIVE_NAMES: Record<AppLocale, string> = {
+  ar: "العربية",
   en: "English",
   es: "Español",
   id: "Bahasa Indonesia",

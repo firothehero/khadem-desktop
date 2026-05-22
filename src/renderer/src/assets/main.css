@@ -5601,4 +5601,38 @@ body {
   text-align: start;
 }
 
+/* ========================================================================
+   RTL — Directional icon mirroring
+   Chevron and arrow icons must point in the semantically correct direction.
+   scaleX(-1) mirrors them without requiring different SVG assets.
+   Exclude rotate-based icons (loading spinners) and checkmarks.
+   ======================================================================== */
+[dir="rtl"] .lucide-chevron-right,
+[dir="rtl"] .lucide-chevron-left,
+[dir="rtl"] .lucide-arrow-right,
+[dir="rtl"] .lucide-arrow-left,
+[dir="rtl"] .lucide-corner-down-right,
+[dir="rtl"] .lucide-corner-down-left,
+[dir="rtl"] .lucide-send,
+[dir="rtl"] .lucide-log-out,
+[dir="rtl"] .lucide-external-link {
+  transform: scaleX(-1);
+}
+
+/* RTL — Text inputs align to the start of the line */
+[dir="rtl"] input[type="text"],
+[dir="rtl"] input[type="email"],
+[dir="rtl"] input[type="password"],
+[dir="rtl"] input[type="url"],
+[dir="rtl"] input[type="search"],
+[dir="rtl"] textarea {
+  direction: auto;
+  text-align: start;
+}
+
+/* RTL — Select dropdown text aligns start */
+[dir="rtl"] select {
+  direction: rtl;
+  text-align: start;
+}
 
