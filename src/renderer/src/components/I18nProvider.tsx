@@ -87,6 +87,14 @@ export function I18nProvider({
     }
   }, [locale, mainLocaleLoaded]);
 
+  // Sync HTML dir + lang attributes with the active locale.
+  // This triggers CSS [dir="rtl"] rules and tells the browser the document language.
+  useEffect(() => {
+    const isArabic = locale === "ar";
+    document.documentElement.setAttribute("dir", isArabic ? "rtl" : "ltr");
+    document.documentElement.setAttribute("lang", locale);
+  }, [locale]);
+
   const value = useMemo<I18nContextValue>(
     () => ({
       locale,

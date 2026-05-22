@@ -410,6 +410,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             onPaste={handlePaste}
             rows={1}
             autoFocus
+            dir="auto"
           />
           {isLoading ? (
             <button

@@ -26,6 +26,26 @@ import soulEn from "./locales/en/soul";
 import memoryEn from "./locales/en/memory";
 import installEn from "./locales/en/install";
 import constantsEn from "./locales/en/constants";
+import commonAr from "./locales/ar/common";
+import navigationAr from "./locales/ar/navigation";
+import welcomeAr from "./locales/ar/welcome";
+import setupAr from "./locales/ar/setup";
+import chatAr from "./locales/ar/chat";
+import settingsAr from "./locales/ar/settings";
+import toolsAr from "./locales/ar/tools";
+import sessionsAr from "./locales/ar/sessions";
+import modelsAr from "./locales/ar/models";
+import providersAr from "./locales/ar/providers";
+import officeAr from "./locales/ar/office";
+import errorsAr from "./locales/ar/errors";
+import schedulesAr from "./locales/ar/schedules";
+import skillsAr from "./locales/ar/skills";
+import gatewayAr from "./locales/ar/gateway";
+import agentsAr from "./locales/ar/agents";
+import soulAr from "./locales/ar/soul";
+import memoryAr from "./locales/ar/memory";
+import installAr from "./locales/ar/install";
+import constantsAr from "./locales/ar/constants";
 import commonEs from "./locales/es/common";
 import navigationEs from "./locales/es/navigation";
 import welcomeEs from "./locales/es/welcome";
@@ -168,6 +188,30 @@ import installPtPt from "./locales/pt-PT/install";
 import constantsPtPt from "./locales/pt-PT/constants";
 
 export const resources = {
+  ar: {
+    translation: {
+      common: commonAr,
+      navigation: navigationAr,
+      welcome: welcomeAr,
+      setup: setupAr,
+      chat: chatAr,
+      settings: settingsAr,
+      tools: toolsAr,
+      sessions: sessionsAr,
+      models: modelsAr,
+      providers: providersAr,
+      office: officeAr,
+      errors: errorsAr,
+      schedules: schedulesAr,
+      skills: skillsAr,
+      gateway: gatewayAr,
+      agents: agentsAr,
+      soul: soulAr,
+      memory: memoryAr,
+      install: installAr,
+      constants: constantsAr,
+    },
+  },
   en: {
     translation: {
       common: commonEn,

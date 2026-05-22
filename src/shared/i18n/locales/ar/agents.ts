@@ -1,0 +1,23 @@
+export default {
+  title: "الملفات الشخصية",
+  subtitle:
+    "كل ملف شخصي هو بيئة عمل خادم منعزلة بإعداداتها وذاكرتها ومهاراتها الخاصة",
+  newAgent: "وكيل جديد",
+  namePlaceholder: "اسم الوكيل (مثال: مبرمج)",
+  cloneConfig: "نسخ الإعدادات ومفاتيح API من الافتراضي",
+  createFailed: "فشل إنشاء الملف الشخصي",
+  creating: "جارٍ الإنشاء...",
+  create: "إنشاء",
+  active: "نشط",
+  noModel: "لم يُحدَّد نموذج",
+  skillsCount: "{{count}} مهارة",
+  gatewayRunning: "البوابة تعمل",
+  gatewayOff: "البوابة متوقفة",
+  chat: "المحادثة",
+  deleteConfirm: "حذف؟",
+  yes: "نعم",
+  no: "لا",
+  deleteTitle: "حذف الوكيل",
+  auto: "تلقائي",
+  local: "محلي",
+} as const;

@@ -1,0 +1,16 @@
+export default {
+  title: "الجلسات",
+  searchPlaceholder: "ابحث في المحادثات...",
+  noResults: "لا نتائج",
+  noResultsHint: "جرّب مصطلحات بحث مختلفة",
+  empty: "لا توجد جلسات بعد",
+  newConversation: "محادثة جديدة",
+  newChat: "محادثة جديدة",
+  today: "اليوم",
+  yesterday: "أمس",
+  thisWeek: "هذا الأسبوع",
+  earlier: "سابقاً",
+  emptyHint: "ابدأ المحادثة لإنشاء جلستك الأولى",
+  messages: "رسالة",
+  messageSingular: "رسالة",
+} as const;

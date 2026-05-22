@@ -668,13 +668,14 @@ function setupIPC(): void {
               !mainWindow.isFocused() &&
               Date.now() - chatStartTime > 10000
             ) {
+              const isAr = getAppLocale() === "ar";
               const preview = fullResponse
                 .replace(/[#*_`~\n]+/g, " ")
                 .trim()
                 .slice(0, 80);
               new Notification({
-                title: "Hermes Agent",
-                body: preview || "Response ready",
+                title: isAr ? "خادم" : "Khadem Agent",
+                body: preview || (isAr ? "الرد جاهز" : "Response ready"),
               }).show();
             }
           },
@@ -684,8 +685,9 @@ function setupIPC(): void {
             rejectChat(new Error(error));
             // Notify on error too if window not focused
             if (mainWindow && !mainWindow.isFocused()) {
+              const isAr = getAppLocale() === "ar";
               new Notification({
-                title: "Hermes Agent — Error",
+                title: isAr ? "خادم — خطأ" : "Khadem Agent — Error",
                 body: error.slice(0, 100),
               }).show();
             }

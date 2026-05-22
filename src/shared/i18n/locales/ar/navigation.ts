@@ -1,0 +1,16 @@
+export default {
+  chat: "المحادثة",
+  sessions: "الجلسات",
+  agents: "الملفات الشخصية",
+  office: "المكتب",
+  models: "النماذج",
+  providers: "المزودون",
+  skills: "المهارات",
+  soul: "الشخصية",
+  memory: "الذاكرة",
+  tools: "الأدوات",
+  schedules: "الجداول",
+  kanban: "كانبان",
+  gateway: "البوابة",
+  settings: "الإعدادات",
+} as const;

@@ -1,3 +1,6 @@
+/* Arabic font — must come first (CSS @import rule) */
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@300;400;500;600;700&display=swap');
+
 /* ========================================================================
    Hermes Agent Desktop — Clean Design System
    Dark + Light mode, no gradients, flat design
@@ -125,9 +128,18 @@
   --font-sans:
     "Google Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     sans-serif;
+  --font-sans-ar:
+    "Noto Sans Arabic", "Google Sans", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
   --font-mono:
     "SF Mono", "Fira Code", "JetBrains Mono", Menlo, Consolas, monospace;
 }
+
+/* RTL — use Arabic font stack, keep mono unchanged */
+html[dir="rtl"] {
+  font-family: var(--font-sans-ar);
+}
+
 
 /* ----- Body ----- */
 body {
@@ -5517,4 +5529,76 @@ body {
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* =============================================================================
+   RTL — Arabic direction overrides
+   Scoped to [dir="rtl"] so they never affect English layout.
+   We keep the sidebar on the LEFT for both languages (per design decision).
+   Only text-bearing and input elements switch direction.
+   ============================================================================= */
+
+/* All user-visible text inputs + textareas auto-detect writing direction */
+[dir="rtl"] input[type="text"],
+[dir="rtl"] input[type="search"],
+[dir="rtl"] input[type="email"],
+[dir="rtl"] input[type="password"],
+[dir="rtl"] textarea {
+  direction: auto;
+  text-align: start;
+}
+
+/* Chat bubble text is always auto-detected per message */
+[dir="rtl"] .message-text,
+[dir="rtl"] .message-content,
+[dir="rtl"] .chat-message p,
+[dir="rtl"] .chat-message li,
+[dir="rtl"] .chat-message h1,
+[dir="rtl"] .chat-message h2,
+[dir="rtl"] .chat-message h3 {
+  direction: auto;
+  text-align: start;
+  unicode-bidi: plaintext;
+}
+
+/* User chat bubble — align to inline-end (right in LTR, left in RTL) */
+[dir="rtl"] .message-user {
+  align-self: flex-start; /* flip: user messages appear on left in RTL */
+}
+
+[dir="rtl"] .message-assistant {
+  align-self: flex-end; /* flip: assistant messages appear on right in RTL */
+}
+
+/* Sidebar: keep it on the left — swap border side so it looks natural */
+[dir="rtl"] .sidebar,
+[dir="rtl"] .nav-sidebar,
+[dir="rtl"] .layout-sidebar {
+  border-right: none;
+  border-left: 1px solid var(--border);
+}
+
+/* Notification / toast text auto-direction */
+[dir="rtl"] .notification-body,
+[dir="rtl"] .toast-message {
+  direction: auto;
+  text-align: start;
+}
+
+/* Code blocks stay LTR regardless of document direction */
+[dir="rtl"] pre,
+[dir="rtl"] code,
+[dir="rtl"] .code-block {
+  direction: ltr;
+  text-align: left;
+  font-family: var(--font-mono);
+}
+
+/* Settings labels — auto-detect so Arabic labels wrap correctly */
+[dir="rtl"] label,
+[dir="rtl"] .setting-label,
+[dir="rtl"] .form-label {
+  direction: auto;
+  text-align: start;
+}
+
 
