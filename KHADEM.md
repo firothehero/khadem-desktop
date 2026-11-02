@@ -5,7 +5,11 @@ Khadem Desktop is a fork of [fathah/hermes-desktop](https://github.com/fathah/he
 merged at any time and Arabic keeps working**: Khadem code lives in Khadem-owned paths, and the
 few upstream files it touches carry one-line hooks that a test verifies after every sync.
 
-![Welcome](docs/khadem/welcome-ar.png)
+| Welcome | Setup | Provider |
+|---|---|---|
+| ![Welcome](docs/khadem/welcome-ar.png) | ![Install](docs/khadem/install-ar.png) | ![Provider](docs/khadem/setup-ar.png) |
+
+![Brand](docs/khadem/brand.png)
 
 ## What Khadem adds
 
@@ -20,7 +24,7 @@ few upstream files it touches carry one-line hooks that a test verifies after ev
 | Hard-coded labels | `src/renderer/src/khadem/hardcoded.ts` | Translates the few English labels upstream renders outside i18n (onboarding eyebrows). |
 | Title & notifications | `src/renderer/src/khadem/index.ts`, `src/main/khadem/branding.ts` | Window title and desktop notifications say خادم / Khadem. |
 | Persona | `src/main/khadem/persona.ts` | Reset SOUL.md writes the Khadem persona (Arabic for Arabic UI). |
-| Agent plugin | `src/main/khadem/agent-plugin.ts`, `resources/khadem-agent-plugin/` | Installs the Khadem agent plugin (from [firothehero/khadem](https://github.com/firothehero/khadem) `plugins/khadem`) into `~/.hermes/plugins/khadem` and enables it once: Arabic persona, خادم-branded agent strings, Arabic defaults, `arabic_text` / `hijri_date` tools, Arabic skills. Works with whatever agent version the upstream installer pins. |
+| Agent plugin | `src/main/khadem/agent-plugin.ts`, `resources/khadem-agent-plugin/` | Installs the Khadem agent plugin (from [firothehero/khadem](https://github.com/firothehero/khadem) `plugins/khadem`) into `~/.hermes/plugins/khadem` and enables it once: Arabic persona, خادم-branded agent strings, Arabic defaults, `arabic_text` / `hijri_date` tools, Arabic skills. Works with whatever agent version the upstream installer pins; skipped when the agent is the Khadem fork (which bundles it). |
 
 Under vitest the layer is inert unless `KHADEM_FORCE=1`, so upstream's own tests keep testing
 upstream behaviour; `tests/khadem/` forces it on. `KHADEM_DISABLE=1` turns it off.

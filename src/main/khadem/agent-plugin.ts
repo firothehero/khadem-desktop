@@ -144,6 +144,10 @@ async function run(): Promise<KhademPluginResult> {
     if (!existsSync(HERMES_PYTHON) || !existsSync(HERMES_REPO)) {
       return { status: "skipped", reason: "Hermes not installed" };
     }
+    // The Khadem agent fork already bundles the plugin (loaded by default); never add a second copy.
+    if (existsSync(join(HERMES_REPO, "plugins", PLUGIN_NAME, "plugin.yaml"))) {
+      return { status: "skipped", reason: "agent already bundles Khadem" };
+    }
     const source = vendoredPluginDir();
     if (!source)
       return { status: "skipped", reason: "vendored plugin missing" };
