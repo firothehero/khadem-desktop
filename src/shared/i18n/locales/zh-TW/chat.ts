@@ -1,4 +1,5 @@
 export default {
+  showEarlierMessages: "顯示更早的 {{count}} 則訊息",
   title: "新聊天",
   sessionTitle: "工作階段 {{id}}",
   noModel: "未設定模型",
@@ -8,6 +9,7 @@ export default {
   quickAskTitle: "快速提問（/btw），不會影響目前對話上下文的旁支問題",
   send: "傳送",
   custom: "自訂",
+  searchModels: "搜尋模型...",
   typeModelName: "輸入模型名稱...",
   emptyTitle: "今天我可以幫你做什麼？",
   emptyHint: "你可以讓我寫程式碼、回答問題、搜尋網頁等",
@@ -21,6 +23,9 @@ export default {
   deny: "拒絕",
   newChat: "新聊天 (Cmd+N)",
   clearChat: "清除聊天",
+  setContextFolder: "設定上下文資料夾",
+  contextFolderActive: "上下文資料夾：{{path}}",
+  removeContextFolder: "移除上下文資料夾",
   fastMode: "快速模式",
   fastModeOn: "快速模式 開啟",
   fastModeActive: "優先處理已啟用，在支援的模型上降低延遲。點擊停用。",
@@ -31,6 +36,11 @@ export default {
   categoryTools: "工具",
   categoryInfo: "資訊",
   noUsageData: "目前沒有使用資料。請先傳送一則訊息。",
+  media: {
+    open: "開啟",
+    saveAs: "另存新檔…",
+    saveImage: "儲存圖片",
+  },
   commands: {
     new: "開始新對話",
     clear: "清除對話歷史",
@@ -55,5 +65,16 @@ export default {
     memory: "檢視 Agent 記憶",
     persona: "檢視目前人格",
     version: "檢視 Hermes 版本",
+  },
+  queued: "{{count}} 則訊息已排隊 — 代理完成後將自動傳送",
+  queuedCancel: "從佇列中移除",
+  copyMessage: "複製訊息",
+  worktree: {
+    loading: "載入中",
+    empty: "資料夾是空的",
+    emptyFolder: "空資料夾",
+    errorLoading: "無法載入資料夾內容",
+    openTerminal: "在此處開啟終端機",
+    openTerminalFailed: "無法為此資料夾開啟終端機。",
   },
 } as const;

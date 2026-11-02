@@ -10,6 +10,7 @@ export default {
   userProfile: "User Profile",
   entries: "{{count}} entries",
   addMemory: "Add Memory",
+  loadFailed: "Failed to load memory",
   addFailed: "Failed to add entry",
   updateFailed: "Failed to update entry",
   saveFailed: "Failed to save",
@@ -17,6 +18,8 @@ export default {
     "e.g. User prefers TypeScript over JavaScript. Always use strict mode.",
   userProfilePlaceholder:
     "e.g. Name: Alex. Senior developer. Prefers concise answers. Uses macOS with zsh. Timezone: PST.",
+  providerDiscoveryUnavailable: "Memory provider discovery is unavailable.",
+  configuredProvider: "Configured provider",
   noProvidersFound: "No memory providers found in this installation.",
   openProviderWebsite: "Open provider website",
   noMemoriesYet:
@@ -44,6 +47,8 @@ export default {
   activating: "Activating...",
   activate: "Activate",
   providers: {
+    recall:
+      "SQLite memory with tiered retrieval and optional local embeddings (external plugin, no provider API key)",
     honcho:
       "AI-native cross-session user modeling with dialectic Q&A and semantic search",
     hindsight:
@@ -57,5 +62,7 @@ export default {
     openviking:
       "Session-managed memory with tiered retrieval and knowledge browsing",
     byterover: "Persistent knowledge tree with tiered retrieval via brv CLI",
+    graphnosis:
+      "Local encrypted engram graph — auto-prefetch, recall, remember. Requires Graphnosis app (no API key)",
   },
 } as const;

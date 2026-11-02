@@ -115,11 +115,9 @@ describe("getConfigValue — dotted paths (issue #247)", () => {
     expect(getConfigValue("agent.service_tier")).toBeNull();
   });
 
-  // Skipped: getYamlPath (introduced by #243) is currently permissive on
-  // grandchildren and flat-key column-0 enforcement.  The strictness
-  // these cases document is desired but not yet present; tracked as a
-  // follow-up against `yaml-path.ts`.
-  it.skip("ignores grandchildren — agent.service_tier matches only direct child", async () => {
+  // getYamlPath enforces direct-child depth: a dotted path's leaf must be a
+  // direct child of its parent block, not a grandchild nested deeper down.
+  it("ignores grandchildren — agent.service_tier matches only direct child", async () => {
     writeFileSync(
       join(TEST_DIR, "config.yaml"),
       [
@@ -150,10 +148,9 @@ describe("getConfigValue — flat keys pinned to top level", () => {
     expect(getConfigValue("timezone")).toBe("America/New_York");
   });
 
-  // Skipped: see note on the grandchildren test above — `getYamlPath`
-  // currently falls through to nested matches when called with a flat
-  // key.  Desired behavior is column-0 enforcement; tracked separately.
-  it.skip("does NOT match a nested occurrence when called with a flat key", async () => {
+  // Flat (single-segment) keys are pinned to column 0, so a nested
+  // occurrence of the same name must not be returned.
+  it("does NOT match a nested occurrence when called with a flat key", async () => {
     writeFileSync(
       join(TEST_DIR, "config.yaml"),
       ["agent:", "  service_tier: fast", "  max_turns: 60", ""].join("\n"),
@@ -163,7 +160,7 @@ describe("getConfigValue — flat keys pinned to top level", () => {
     expect(getConfigValue("service_tier")).toBeNull();
   });
 
-  it.skip("does NOT pick the first nested occurrence across siblings", async () => {
+  it("does NOT pick the first nested occurrence across siblings", async () => {
     writeFileSync(
       join(TEST_DIR, "config.yaml"),
       [
@@ -228,12 +225,60 @@ describe("setConfigValue — dotted paths", () => {
     expect(after).toContain('service_tier: "normal"');
   });
 
-  it("is a no-op for missing nested paths (don't guess where to create the parent)", async () => {
+  it("creates a missing direct nested key under an existing parent block", async () => {
+    writeFileSync(
+      join(TEST_DIR, "config.yaml"),
+      [
+        "network:",
+        "  force_ipv4: false",
+        "security:",
+        "  redact_secrets: true",
+        "",
+      ].join("\n"),
+    );
+
+    const { setConfigValue, getConfigValue } =
+      await importConfigWithHome(TEST_DIR);
+    setConfigValue("network.proxy", "socks5://127.0.0.1:1080");
+
+    const after = readFileSync(join(TEST_DIR, "config.yaml"), "utf-8");
+    expect(after).toContain("network:\n  force_ipv4: false\n");
+    expect(after).toContain('  proxy: "socks5://127.0.0.1:1080"\nsecurity:');
+    expect(getConfigValue("network.proxy")).toBe("socks5://127.0.0.1:1080");
+  });
+
+  it("creates a missing direct nested key with a new parent block", async () => {
     const before = ["display:", "  compact: true", ""].join("\n");
     writeFileSync(join(TEST_DIR, "config.yaml"), before);
 
+    const { setConfigValue, getConfigValue } =
+      await importConfigWithHome(TEST_DIR);
+    setConfigValue("network.proxy", "http://proxy:8080");
+
+    const after = readFileSync(join(TEST_DIR, "config.yaml"), "utf-8");
+    expect(after).toContain("display:\n  compact: true\n");
+    expect(after).toContain('network:\n  proxy: "http://proxy:8080"\n');
+    expect(getConfigValue("network.proxy")).toBe("http://proxy:8080");
+  });
+
+  it("quotes created nested values safely", async () => {
+    writeFileSync(join(TEST_DIR, "config.yaml"), ["network:", ""].join("\n"));
+
     const { setConfigValue } = await importConfigWithHome(TEST_DIR);
-    setConfigValue("agent.service_tier", "fast");
+    setConfigValue("network.proxy", 'http://proxy:8080/path?name="quoted"');
+
+    const after = readFileSync(join(TEST_DIR, "config.yaml"), "utf-8");
+    expect(after).toContain(
+      '  proxy: "http://proxy:8080/path?name=\\"quoted\\""\n',
+    );
+  });
+
+  it("is a no-op for deeper missing nested paths", async () => {
+    const before = ["agent:", "  max_turns: 60", ""].join("\n");
+    writeFileSync(join(TEST_DIR, "config.yaml"), before);
+
+    const { setConfigValue } = await importConfigWithHome(TEST_DIR);
+    setConfigValue("agent.fallback.service_tier", "fast");
 
     const after = readFileSync(join(TEST_DIR, "config.yaml"), "utf-8");
     expect(after).toBe(before);

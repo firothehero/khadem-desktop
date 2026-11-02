@@ -57,7 +57,8 @@ describe("I18nProvider", () => {
     }
   });
 
-  it("renders English translations by default", async () => {
+  // Khadem is Arabic-first: DEFAULT_ACTIVE_LOCALE is "ar".
+  it("renders Arabic translations by default", async () => {
     await act(async () => {
       render(
         <I18nProvider>
@@ -66,7 +67,7 @@ describe("I18nProvider", () => {
       );
     });
 
-    expect(await screen.findByText("Welcome to Hermes")).toBeInTheDocument();
+    expect(await screen.findByText("مرحباً بك في خادم")).toBeInTheDocument();
   });
 
   it("renders Spanish translations after switching locale", async () => {
@@ -110,5 +111,23 @@ describe("I18nProvider", () => {
 
     expect(setLocale).toHaveBeenLastCalledWith("es");
     expect(await screen.findByText("Bienvenido a Hermes")).toBeInTheDocument();
+  });
+
+  // @lat: [[rtl-chat#Persian locale#Persisted Persian startup]]
+  it("restores a persisted main-process Persian locale without overwriting it with English", async () => {
+    getLocale.mockResolvedValue("fa");
+    await act(async () => {
+      render(
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>,
+      );
+    });
+    expect(setLocale).toHaveBeenCalledWith("fa");
+    expect(setLocale).not.toHaveBeenCalledWith("en");
+    expect(document.documentElement).toHaveAttribute("dir", "rtl");
+    expect(document.documentElement).toHaveAttribute("lang", "fa");
+    expect(localStorage.getItem("hermes-locale")).toBe("fa");
+    expect(screen.getByText("Welcome to Hermes One")).toBeInTheDocument();
   });
 });

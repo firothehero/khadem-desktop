@@ -16,19 +16,19 @@ mode**, which is what this document covers.
 The desktop app has two remote modes, and they cover very different
 surface areas:
 
-| Screen / feature | Remote (HTTP + API key) | SSH Tunnel |
-| --- | :---: | :---: |
-| Chat (`/v1/chat/completions`) | ✅ | ✅ |
-| Sessions list & search | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Skills (browse, install, uninstall) | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Memory (view/edit entries, user profile) | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Soul (persona editor) | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Tools (toolset enable/disable) | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Schedules (cron jobs) | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
-| Gateway (status, start/stop, platform toggles) | ❌ reads local | ✅ via SSH proxy |
-| Profile switching | ❌ reads local | ✅ via SSH proxy |
-| Models (saved per-provider configs) | ❌ reads local | ✅ via SSH proxy |
-| Logs (gateway, agent) | ❌ reads local | ✅ via SSH proxy |
+| Screen / feature                               |  Remote (HTTP + API key)   |    SSH Tunnel    |
+| ---------------------------------------------- | :------------------------: | :--------------: |
+| Chat (`/v1/chat/completions`)                  |             ✅             |        ✅        |
+| Sessions list & search                         | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Skills (browse, install, uninstall)            | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Memory (view/edit entries, user profile)       | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Soul (persona editor)                          | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Tools (toolset enable/disable)                 | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Schedules (cron jobs)                          | ❌ reads local `~/.hermes` | ✅ via SSH proxy |
+| Gateway (status, start/stop, platform toggles) |       ❌ reads local       | ✅ via SSH proxy |
+| Profile switching                              |       ❌ reads local       | ✅ via SSH proxy |
+| Models (saved per-provider configs)            |       ❌ reads local       | ✅ via SSH proxy |
+| Logs (gateway, agent)                          |       ❌ reads local       | ✅ via SSH proxy |
 
 Plain Remote mode only proxies the chat path. **All other screens read
 the local `~/.hermes` directory**, so if you have no Hermes install on the
@@ -117,6 +117,36 @@ SSH in as the `hermes` user. Two things to set up:
 Don't. If it currently does, migrate it to a dedicated user before
 exposing SSH to it.
 
+### Case D — Hermes runs in a Docker container (Coolify, Compose, NAS)
+
+A containerized `nousresearch/hermes-agent` deployment is fully
+supported, but the host has no `hermes` binary and no real `~/.hermes` —
+the CLI lives inside the container and the data lives in the volume
+mounted at the container's `/opt/data`. Without setup, chat works (the
+API port is reachable through the tunnel) while Sessions, Models, Logs,
+and Doctor come up empty.
+
+The desktop can set this up for you. In **Settings → Connection → SSH**
+(or the first-run SSH screen), use **Detect remote install**. The
+desktop lists running Hermes containers; pick one (required when several
+run) and click **Set up Docker access**. This writes two files on the
+SSH host, as the SSH user:
+
+- `~/.config/hermes-desktop/remote-hermes` — a launcher that runs the
+  Hermes CLI inside the selected container via `docker exec`. This is
+  the standard per-user launcher hook the desktop already probes first
+  for every remote CLI call, so gateway controls, Doctor, skills, and
+  profile listing all route into the container automatically.
+- `~/.hermes` → symlink to the container's data volume (for example
+  `/data/hermes`), so session lists, config, logs, and memory read the
+  real Hermes home.
+
+Requirements: the SSH user must be able to run `docker` (root or a user
+in the `docker` group), and the container must mount a host directory at
+`/opt/data`. Nothing inside the container is modified, and an existing
+hand-written launcher or a real `~/.hermes` directory is never
+overwritten — the setup refuses and tells you what to move.
+
 ## Step-by-step setup
 
 ### 1. Verify SSH works exactly as the desktop will call it
@@ -145,13 +175,13 @@ desktop app.
 
 Open **Settings → Connection** and select **SSH Tunnel**. Fill in:
 
-| Field | Value |
-| --- | --- |
-| SSH Host | hostname or IP of the remote (e.g. `your.vps.example.com`) |
-| SSH Port | `22` (or your sshd port) |
-| Username | the user whose `~/.hermes` is the real one (`hermes` in Case B) |
-| Private Key Path | absolute path, e.g. `~/.ssh/id_ed25519` on macOS/Linux or `C:\Users\you\.ssh\id_ed25519` on Windows |
-| Remote Hermes Port | `8642` (default) |
+| Field              | Value                                                                                               |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| SSH Host           | hostname or IP of the remote (e.g. `your.vps.example.com`)                                          |
+| SSH Port           | `22` (or your sshd port)                                                                            |
+| Username           | the user whose `~/.hermes` is the real one (`hermes` in Case B)                                     |
+| Private Key Path   | absolute path, e.g. `~/.ssh/id_ed25519` on macOS/Linux or `C:\Users\you\.ssh\id_ed25519` on Windows |
+| Remote Hermes Port | `8642` (default)                                                                                    |
 
 Click **Test SSH Connection**. Expected result: "SSH tunnel connected!".
 Then **Save** and restart the app.
@@ -159,7 +189,7 @@ Then **Save** and restart the app.
 ### 3. (Alternative) Edit `~/.hermes/desktop.json` directly
 
 If you prefer to skip the UI, the same config is stored at
-`~/.hermes/desktop.json` (the desktop app's *local* config, on the
+`~/.hermes/desktop.json` (the desktop app's _local_ config, on the
 desktop machine — not on the VPS):
 
 ```json
@@ -184,7 +214,7 @@ plain Remote mode by changing only `connectionMode`.
 ## Verifying every screen works
 
 After restart, walk through these screens — each should reflect data
-from the *remote* `~/.hermes`, not your local one:
+from the _remote_ `~/.hermes`, not your local one:
 
 - **Chat** — send a message. Tokens should stream.
 - **Sessions** — should list past conversations from the VPS.
@@ -211,6 +241,7 @@ includes [PR #204][#204] or apply the fix from those issues.
 ### "Permission denied (publickey)" from the desktop, but my key works in the terminal
 
 Most common causes:
+
 - You use a different key from your terminal (via `~/.ssh/config` host
   alias or `ssh-agent`) than the path you configured in the desktop. The
   desktop only uses the explicit key file you give it (`BatchMode=yes`
@@ -233,6 +264,11 @@ The directory should contain `SOUL.md`, `config.yaml`, `auth.json`,
 `memories/`, `profiles/`, etc. If you see `No such file or directory`,
 you're in the wrong account — re-read the **"Which user account"**
 section above.
+
+If Hermes runs in a Docker container on the remote (Doctor reports
+`hermes CLI not found on remote PATH…`), no user has a real `~/.hermes`
+— use **Detect remote install** in the SSH settings and run the Docker
+setup (see **Case D** above).
 
 ### Settings → Hermes Agent shows blank Engine / Released / Python / OpenAI SDK
 

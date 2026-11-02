@@ -1,5 +1,5 @@
 export default {
-  appName: "Hermes Agent",
+  appName: "Hermes One",
   continue: "继续",
   cancel: "取消",
   retry: "重试",
@@ -40,6 +40,8 @@ export default {
   devOnly: "开发者专用",
   updateAvailable: "更新 v{{version}}",
   downloading: "下载中 {{percent}}%",
+  downloadingUnknown: "正在下载...",
+  waitingForDownloadProgress: "正在等待下载进度...",
   restartToUpdate: "重启以更新",
   updateFailed: "更新失败",
   errorTitle: "出现错误",

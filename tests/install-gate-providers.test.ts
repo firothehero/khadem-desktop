@@ -17,6 +17,8 @@ describe("expectedEnvKeyForModel — provider-name lookup", () => {
     ["openrouter", "OPENROUTER_API_KEY"],
     ["anthropic", "ANTHROPIC_API_KEY"],
     ["openai", "OPENAI_API_KEY"],
+    ["ollama-cloud", "OLLAMA_API_KEY"],
+    ["aimlapi", "AIMLAPI_API_KEY"],
     ["google", "GOOGLE_API_KEY"],
     ["xai", "XAI_API_KEY"],
     ["deepseek", "DEEPSEEK_API_KEY"], // the specific provider from issue #236
@@ -27,10 +29,18 @@ describe("expectedEnvKeyForModel — provider-name lookup", () => {
     ["cerebras", "CEREBRAS_API_KEY"],
     ["perplexity", "PERPLEXITY_API_KEY"],
     ["huggingface", "HF_TOKEN"], // exception to the *_API_KEY convention
-    ["qwen", "QWEN_API_KEY"],
+    ["alibaba", "DASHSCOPE_API_KEY"],
+    // The agent's DashScope aliases — `qwen` is what pre-#825 desktop
+    // configs stored, so it must keep resolving to a real key check.
+    ["dashscope", "DASHSCOPE_API_KEY"],
+    ["qwen", "DASHSCOPE_API_KEY"],
+    ["aliyun", "DASHSCOPE_API_KEY"],
+    ["alibaba-cloud", "DASHSCOPE_API_KEY"],
+    ["qwen-oauth", "QWEN_API_KEY"],
     ["minimax", "MINIMAX_API_KEY"],
     ["glm", "GLM_API_KEY"],
     ["kimi", "KIMI_API_KEY"],
+    ["xiaomi", "XIAOMI_API_KEY"],
   ])("maps provider %s → %s", (provider, expected) => {
     expect(expectedEnvKeyForModel(provider, "")).toBe(expected);
   });
@@ -46,6 +56,62 @@ describe("expectedEnvKeyForModel — provider-name lookup", () => {
 });
 
 describe("expectedEnvKeyForModel — URL fallback for custom/auto providers", () => {
+  // @lat: [[provider-setup#API Route provider preset#Installer readiness]]
+  it.each([
+    ["https://global.api-route.com/v1", "API_ROUTE_API_KEY"],
+    [
+      "https://openai.com:password@global.api-route.com:443/v1",
+      "API_ROUTE_API_KEY",
+    ],
+    ["https://GLOBAL.API-ROUTE.COM/v1", "API_ROUTE_API_KEY"],
+    ["https://global.api-route.com.attacker.example/v1", null],
+    ["https://global.api-route.com@evil.example/v1", null],
+    ["https://evil.example/global.api-route.com/v1", null],
+  ])("resolves API Route installer credentials for %s", (url, expected) => {
+    expect(expectedEnvKeyForModel("custom", url)).toBe(expected);
+    expect(expectedEnvKeyForModel("auto", url)).toBe(expected);
+  });
+  it.each([
+    [
+      "https://user:pass@api.cheaperinference.com:443/v1",
+      "CHEAPERINFERENCE_API_KEY",
+    ],
+    ["https://API.CHEAPERINFERENCE.COM:443/v1", "CHEAPERINFERENCE_API_KEY"],
+    [
+      "https://openai.com:password@api.cheaperinference.com/v1",
+      "CHEAPERINFERENCE_API_KEY",
+    ],
+    [
+      "https://api.cheaperinference.com/v1/api.openai.com",
+      "CHEAPERINFERENCE_API_KEY",
+    ],
+    [
+      "https://api.cheaperinference.com/api.deepseek.com/v1",
+      "CHEAPERINFERENCE_API_KEY",
+    ],
+    ["https://api.cheaperinference.com:443@evil.example/v1", null],
+    ["https://user:pass@api.cheaperinference.com.attacker.example/v1", null],
+  ])(
+    "uses the parsed Cheaper Inference hostname for installer readiness %s",
+    (url, expected) => {
+      expect(expectedEnvKeyForModel("custom", url)).toBe(expected);
+    },
+  );
+
+  it.each([
+    ["https://user:pass@router.requesty.ai:443/v1", "REQUESTY_API_KEY"],
+    ["https://ROUTER.EU.REQUESTY.AI:443/v1", "REQUESTY_API_KEY"],
+    ["https://openai.com:password@router.requesty.ai/v1", "REQUESTY_API_KEY"],
+    ["https://router.requesty.ai/v1/api.openai.com", "REQUESTY_API_KEY"],
+    ["https://router.requesty.ai/api.deepseek.com/v1", "REQUESTY_API_KEY"],
+    ["https://router.requesty.ai:443@evil.example/v1", null],
+    ["https://user:pass@requesty.ai.attacker.example/v1", null],
+  ])(
+    "uses the parsed Requesty hostname for installer readiness %s",
+    (url, expected) => {
+      expect(expectedEnvKeyForModel("custom", url)).toBe(expected);
+    },
+  );
   it("recognizes a known endpoint when provider is 'custom'", () => {
     expect(
       expectedEnvKeyForModel("custom", "https://api.deepseek.com/v1"),
@@ -56,12 +122,33 @@ describe("expectedEnvKeyForModel — URL fallback for custom/auto providers", ()
     expect(
       expectedEnvKeyForModel("custom", "https://openrouter.ai/api/v1"),
     ).toBe("OPENROUTER_API_KEY");
+    expect(expectedEnvKeyForModel("custom", "https://ollama.com/v1")).toBe(
+      "OLLAMA_API_KEY",
+    );
+    expect(expectedEnvKeyForModel("custom", "https://api.aimlapi.com/v1")).toBe(
+      "AIMLAPI_API_KEY",
+    );
+    expect(
+      expectedEnvKeyForModel("custom", "https://api.xiaomimimo.com/v1"),
+    ).toBe("XIAOMI_API_KEY");
   });
 
   it("recognizes a known endpoint when provider is 'auto'", () => {
     expect(expectedEnvKeyForModel("auto", "https://api.mistral.ai/v1")).toBe(
       "MISTRAL_API_KEY",
     );
+  });
+
+  it("only maps requesty.ai hosts to the Requesty key", () => {
+    expect(
+      expectedEnvKeyForModel("custom", "https://router.requesty.ai/v1"),
+    ).toBe("REQUESTY_API_KEY");
+    expect(
+      expectedEnvKeyForModel(
+        "custom",
+        "https://requesty.ai.attacker.example/v1",
+      ),
+    ).toBeNull();
   });
 
   it("returns null for unknown provider with unknown URL", () => {
