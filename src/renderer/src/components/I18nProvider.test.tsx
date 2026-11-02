@@ -57,8 +57,7 @@ describe("I18nProvider", () => {
     }
   });
 
-  // Khadem is Arabic-first: DEFAULT_ACTIVE_LOCALE is "ar".
-  it("renders Arabic translations by default", async () => {
+  it("renders English translations by default", async () => {
     await act(async () => {
       render(
         <I18nProvider>
@@ -67,7 +66,9 @@ describe("I18nProvider", () => {
       );
     });
 
-    expect(await screen.findByText("مرحباً بك في خادم")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Welcome to Hermes One"),
+    ).toBeInTheDocument();
   });
 
   it("renders Spanish translations after switching locale", async () => {

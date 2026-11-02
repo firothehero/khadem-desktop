@@ -17,6 +17,7 @@ import {
   isAllowedWebviewUrl,
 } from "../security";
 import { registerIpcHandlers } from "../ipc/register";
+import { ensureKhademAgentPlugin } from "../khadem/agent-plugin"; // KHADEM-PATCH
 import { setGatewayPromptParent } from "../gatewayPrompt";
 import { showChatContextMenu } from "./context-menu";
 import { buildMenu } from "./menu";
@@ -106,6 +107,7 @@ export function startMainProcess(): void {
     });
 
     createWindow();
+    void ensureKhademAgentPlugin(); // KHADEM-PATCH: Khadem agent plugin (KHADEM.md)
     buildMenu({ getMainWindow: () => mainWindow, openExternalUrl });
 
     app.on("activate", () => {

@@ -1,4 +1,5 @@
 import i18next, { type Resource } from "i18next";
+import { applyKhademLayer } from "./khadem/apply"; // KHADEM-PATCH (see KHADEM.md)
 import botGroupsEn from "./locales/en/botGroups";
 import botGroupsZh from "./locales/zh-CN/botGroups";
 import {
@@ -590,6 +591,8 @@ export const resources = {
     },
   },
 } satisfies Resource;
+
+applyKhademLayer(resources); // KHADEM-PATCH: Arabic gap-fill + خادم branding (see KHADEM.md)
 
 function readKey(node: unknown, path: string): string | undefined {
   const result = path.split(".").reduce<unknown>((current, part) => {

@@ -1,4 +1,5 @@
 import "./assets/main.css";
+import "./khadem"; // KHADEM-PATCH: Arabic typography, fonts, title (see KHADEM.md)
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

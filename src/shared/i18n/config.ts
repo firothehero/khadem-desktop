@@ -1,8 +1,11 @@
 import type { AppLocale } from "./types";
+import { KHADEM_DEFAULT_LOCALE, khademActive } from "./khadem/active"; // KHADEM-PATCH
 
 export const SOURCE_LOCALE: AppLocale = "en";
 export const FALLBACK_LOCALE: AppLocale = "en";
-export const DEFAULT_ACTIVE_LOCALE: AppLocale = "ar"; // Khadem: Arabic-first
+export const DEFAULT_ACTIVE_LOCALE: AppLocale = khademActive()
+  ? KHADEM_DEFAULT_LOCALE
+  : "en"; // KHADEM-PATCH
 export const APP_LOCALES: AppLocale[] = [
   "en",
   "ar",

@@ -47,7 +47,7 @@ describe("MessageRow user Markdown", () => {
     expect(screen.getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByRole("table")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /copy|نسخ/i }));
+    fireEvent.click(screen.getByRole("button", { name: /copy/i }));
     expect(copyToClipboard).toHaveBeenCalledWith(source);
   });
 
@@ -79,7 +79,7 @@ describe("MessageRow user Markdown", () => {
         "dir",
         "ltr",
       );
-      fireEvent.click(screen.getByRole("button", { name: /copy|نسخ/i }));
+      fireEvent.click(screen.getByRole("button", { name: /copy/i }));
       expect(copyToClipboard).toHaveBeenCalledWith(source);
     },
   );

@@ -21,10 +21,8 @@ describe("shared i18n", () => {
     expect(t("welcome.title", "fa")).toBe(t("welcome.title", "en"));
   });
 
-  // Khadem is Arabic-first: DEFAULT_ACTIVE_LOCALE is "ar".
-  it("returns Arabic text by default", () => {
-    expect(t("welcome.title")).toBe("مرحباً بك في خادم");
-    expect(t("welcome.title", "en")).toBe("Welcome to Hermes One");
+  it("returns English text by default", () => {
+    expect(t("welcome.title")).toBe("Welcome to Hermes One");
   });
 
   it("falls back to the key when an English key is missing", () => {

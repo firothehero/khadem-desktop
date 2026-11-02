@@ -433,6 +433,12 @@ import {
 } from "../kanban";
 import { getAppLocale, setAppLocale } from "../locale";
 import {
+  khademAppName,
+  khademErrorTitle,
+  khademResponseReady,
+} from "../khadem/branding"; // KHADEM-PATCH
+import { ensureKhademAgentPlugin } from "../khadem/agent-plugin"; // KHADEM-PATCH
+import {
   sshListInstalledSkills,
   sshGetSkillContent,
   sshInstallSkill,
@@ -508,8 +514,7 @@ export interface IpcContext {
   openExternalUrl: (rawUrl: unknown) => void;
 }
 
-// Khadem: user-facing notification branding (the app identity in app/start.ts is left as-is).
-const KHADEM_NAME = process.env.HERMES_DESKTOP_APP_NAME?.trim() || "Khadem";
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME?.trim() || "Hermes One";
 
 type RemoteSessionBridgeConfig = RemoteSessionConfig;
 
@@ -832,6 +837,7 @@ export function registerIpcHandlers(context: IpcContext): void {
       await runInstall((progress: InstallProgress) => {
         event.sender.send("install-progress", progress);
       }, mainWindow);
+      await ensureKhademAgentPlugin(); // KHADEM-PATCH: Khadem agent plugin (KHADEM.md)
       return { success: true };
     } catch (err) {
       return { success: false, error: (err as Error).message };
@@ -2056,10 +2062,9 @@ export function registerIpcHandlers(context: IpcContext): void {
                   .replace(/[#*_`~\n]+/g, " ")
                   .trim()
                   .slice(0, 80);
-                const isAr = getAppLocale() === "ar";
                 new Notification({
-                  title: isAr ? "خادم" : KHADEM_NAME,
-                  body: preview || (isAr ? "الرد جاهز" : "Response ready"),
+                  title: khademAppName(getAppLocale(), APP_NAME), // KHADEM-PATCH
+                  body: preview || khademResponseReady(getAppLocale()), // KHADEM-PATCH
                 }).show();
               }
             },
@@ -2076,10 +2081,7 @@ export function registerIpcHandlers(context: IpcContext): void {
               // Notify on error too if window not focused
               if (mainWindow && !mainWindow.isFocused()) {
                 new Notification({
-                  title:
-                    getAppLocale() === "ar"
-                      ? "خادم — خطأ"
-                      : `${KHADEM_NAME} — Error`,
+                  title: khademErrorTitle(getAppLocale(), APP_NAME), // KHADEM-PATCH
                   body: error.slice(0, 100),
                 }).show();
               }

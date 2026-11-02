@@ -1,15 +1,33 @@
 # Khadem Arabic layer
 
-Khadem Desktop is an Arabic-first rebrand of Hermes Desktop. Upstream supplies the Arabic locale and RTL support; Khadem adds the defaults and branding below.
+Khadem Desktop is an Arabic-first rebrand of Hermes Desktop kept in Khadem-owned files, with one-line hooks in upstream files so upstream merges stay clean. KHADEM.md has the full ledger.
 
-## Arabic default locale
+## Activation
 
-New installs open in Arabic because [[src/shared/i18n/config.ts#DEFAULT_ACTIVE_LOCALE]] is `ar`. Untranslated Arabic keys still fall back to English, and users can pick another language in Settings.
+[[src/shared/i18n/khadem/active.ts#khademActive]] turns the layer on in the app and off under vitest unless `KHADEM_FORCE=1`, so upstream tests keep testing upstream behaviour.
 
-## Khadem branding
+New installs open in Arabic through [[src/shared/i18n/config.ts#DEFAULT_ACTIVE_LOCALE]]; users can still pick another language in Settings.
 
-Arabic UI strings name the agent خادم instead of Hermes, Hermes One or Hermes Agent. Desktop notifications use خادم under Arabic and Khadem otherwise; the internal app identity stays unchanged so user data paths do not move.
+## Catalog layer
 
-## Khadem persona
+[[src/shared/i18n/khadem/apply.ts#applyKhademLayer]] runs once on the shared resources before i18next initialises.
 
-Resetting a profile's SOUL.md through [[src/main/soul.ts#resetSoul]] writes the Khadem persona: Arabic under the Arabic locale, English otherwise. It tells the agent it is Khadem and to reply in the user's language.
+It fills Arabic gaps under upstream's translations, applies Khadem overrides, then brands Arabic and English through [[src/shared/i18n/khadem/brand.ts#brandText]]. Keys naming the external Hermes One cloud account keep that name.
+
+## Renderer layer
+
+[[src/renderer/src/khadem/index.ts#installKhademRenderer]] loads Khadem typography, prefixes every font option with IBM Plex Sans Arabic, titles the window, and translates hard-coded labels.
+
+The hard-coded label table lives in [[src/renderer/src/khadem/hardcoded.ts#HARDCODED_LABELS]]. Khadem's stylesheet also mirrors direction icons in RTL and swaps onboarding and splash marks for the Khadem seal and wordmark.
+
+## Agent plugin
+
+[[src/main/khadem/agent-plugin.ts#ensureKhademAgentPlugin]] copies the vendored Khadem agent plugin into the local Hermes home and enables it once, at startup and after install.
+
+Remote connections are skipped. The plugin gives the agent the Khadem persona, Arabic defaults, branded agent strings, Arabic tools and skills.
+
+## Persona and notifications
+
+Resetting a profile's SOUL.md through [[src/main/soul.ts#resetSoul]] writes the Khadem persona, Arabic under the Arabic locale.
+
+Desktop notifications use [[src/main/khadem/branding.ts#khademAppName]], so they read خادم or Khadem unless an explicit app-name override is set.
