@@ -1,0 +1,30 @@
+# Khadem (خادم) build identity — layered over upstream's electron-builder.yml so upstream changes to
+# the base config flow in on every sync. Build with:  scripts/khadem/build.sh [--linux|--mac|--win]
+#
+# Changes vs upstream: product name/ids (Khadem is a separate app with its own user-data folder) and
+# the auto-update feed (Khadem must update from Khadem releases, never into stock Hermes One).
+extends: ./electron-builder.yml
+appId: com.khadem.desktop
+productName: Khadem
+publish:
+  provider: github
+  owner: firothehero
+  repo: khadem-desktop
+nsis:
+  shortcutName: Khadem
+  uninstallDisplayName: Khadem
+mac:
+  executableName: Khadem
+  # electron-builder concatenates extendInfo lists (base first); this later entry wins.
+  extendInfo:
+    - CFBundleDisplayName: خادم
+linux:
+  vendor: Khadem
+  synopsis: Arabic-first self-improving AI agent desktop app
+  description: >-
+    خادم (Khadem) is an Arabic-first desktop app for installing, configuring and chatting with
+    the Khadem agent — a self-improving AI assistant built on Hermes Agent.
+  desktop:
+    entry:
+      Name: خادم
+      Comment: خادم — وكيل ذكاء اصطناعي عربي

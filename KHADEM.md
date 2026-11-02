@@ -29,6 +29,20 @@ few upstream files it touches carry one-line hooks that a test verifies after ev
 Under vitest the layer is inert unless `KHADEM_FORCE=1`, so upstream's own tests keep testing
 upstream behaviour; `tests/khadem/` forces it on. `KHADEM_DISABLE=1` turns it off.
 
+## Building Khadem installers
+
+```bash
+scripts/khadem/build.sh --linux     # or --mac / --win
+```
+
+`electron-builder.khadem.yml` extends upstream's `electron-builder.yml` (so upstream packaging
+changes still apply) and overrides only the identity — `appId: com.khadem.desktop`,
+`productName: Khadem`, Arabic display names — and the **auto-update feed**
+(`firothehero/khadem-desktop` releases). Never ship a build made with the base config: its update
+feed points at upstream Hermes One releases and would replace Khadem with the stock app.
+Upstream's `release.yml` workflow still uses the base config; publish Khadem releases with the
+Khadem config.
+
 ## Syncing upstream
 
 ```bash
@@ -66,4 +80,4 @@ On a merge conflict in one of these files: take upstream's version, re-add the h
 
 Khadem-owned paths: `src/**/khadem/`, `tests/khadem/`, `scripts/khadem/`,
 `resources/khadem-agent-plugin/`, `docs/khadem/`, `.github/workflows/khadem-sync.yml`,
-`KHADEM.md`, `lat.md/khadem-arabic.md`.
+`KHADEM.md`, `lat.md/khadem-arabic.md`, `electron-builder.khadem.yml`.
