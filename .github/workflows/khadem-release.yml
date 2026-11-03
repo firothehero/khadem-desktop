@@ -80,8 +80,10 @@ jobs:
       - name: Verify macOS native module architecture
         if: runner.os == 'macOS'
         run: |
-          APP=$(ls -d dist/mac*/Khadem.app | head -1)
-          file "$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" | tee /dev/stderr | grep -q "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+          APP="dist/mac-${{ matrix.arch }}/Khadem.app"; [ -d "$APP" ] || APP="dist/mac/Khadem.app"
+          NODE="$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/prebuilds/darwin-${{ matrix.arch }}.node"
+          file "$NODE"
+          file "$NODE" | grep -q "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
