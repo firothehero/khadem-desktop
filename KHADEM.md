@@ -40,8 +40,13 @@ changes still apply) and overrides only the identity — `appId: com.khadem.desk
 `productName: Khadem`, Arabic display names — and the **auto-update feed**
 (`firothehero/khadem-desktop` releases). Never ship a build made with the base config: its update
 feed points at upstream Hermes One releases and would replace Khadem with the stock app.
-Upstream's `release.yml` workflow still uses the base config; publish Khadem releases with the
-Khadem config.
+Publish releases with **Actions → Khadem release** (`.github/workflows/khadem-release.yml`): it
+builds Linux, macOS (x64 + arm64) and Windows installers with the Khadem config and publishes them
+as `v<package.json version>` on this repo's Releases, where the in-app updater looks. Builds are
+unsigned until Apple/Windows signing credentials are added (then set `mac.notarize: true`).
+Upstream's own `release.yml` only runs on a `release` branch and must not be used.
+
+App icons: `build/khadem/icon.{png,icns,ico}` (packaged apps) and `resources/icon.png` (window icon).
 
 ## Syncing upstream
 
@@ -52,6 +57,9 @@ scripts/khadem/sync-upstream.sh     # fetch + merge upstream/main, npm ci, scrip
 `check.sh` = typecheck + `tests/khadem` (incl. the patch-ledger test and a zero-missing-Arabic test)
 + upstream i18n tests + `npx tsx scripts/khadem/i18n-report.mts` (coverage report).
 `.github/workflows/khadem-sync.yml` runs it weekly and opens a PR from `khadem/upstream-sync`.
+The built-in Actions token cannot push merges that change `.github/workflows/`; add a
+`KHADEM_SYNC_TOKEN` secret (PAT with repo + workflow scopes) to make that fully automatic —
+without it the workflow opens an "Upstream sync ready" issue with the check results instead.
 
 ### When a sync reports something
 
@@ -76,8 +84,11 @@ On a merge conflict in one of these files: take upstream's version, re-add the h
 | `src/main/app/start.ts` | import + `void ensureKhademAgentPlugin()` after `createWindow()` |
 | `src/renderer/src/screens/Chat/ChatInput.tsx` | `dir="auto"` on the chat textarea |
 | `.gitignore` | `lat.md/.cache/parsed/` |
+| `.gitattributes` | `resources/icon.png merge=ours` (keeps the Khadem window icon; driver registered by `sync-upstream.sh`) |
+| `resources/icon.png` | replaced by the Khadem icon (runtime window icon) |
 | `lat.md/lat.md` | index entry for `[[khadem-arabic]]` |
 
 Khadem-owned paths: `src/**/khadem/`, `tests/khadem/`, `scripts/khadem/`,
 `resources/khadem-agent-plugin/`, `docs/khadem/`, `.github/workflows/khadem-sync.yml`,
-`KHADEM.md`, `lat.md/khadem-arabic.md`, `electron-builder.khadem.yml`.
+`KHADEM.md`, `lat.md/khadem-arabic.md`, `electron-builder.khadem.yml`, `build/khadem/`,
+`.github/workflows/khadem-release.yml`.

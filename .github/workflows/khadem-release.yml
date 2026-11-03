@@ -1,0 +1,149 @@
+# Khadem: build and publish Khadem Desktop installers (Khadem identity, icon and update feed from
+# electron-builder.khadem.yml) to this repository's GitHub Releases as tag v<package.json version>.
+# Unsigned for now: no Apple/Windows signing credentials are configured for Khadem.
+name: Khadem release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build everything but skip publishing (no tag, no release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: khadem-release
+  cancel-in-progress: false
+
+env:
+  KHADEM_CONFIG: electron-builder.khadem.yml
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "::notice::v$VERSION already released — nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.exists == 'false'
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64, os: ubuntu-latest, args: "--linux AppImage deb rpm --x64", arch: x64 }
+          - { name: mac-x64, os: macos-latest, args: "--mac dmg zip --x64", arch: x64 }
+          - { name: mac-arm64, os: macos-latest, args: "--mac dmg zip --arm64", arch: arm64 }
+          - { name: windows-x64, os: windows-latest, args: "--win nsis portable --x64", arch: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Rebuild native dependencies for target arch
+        if: runner.os != 'Windows'
+        run: npx electron-builder install-app-deps --arch=${{ matrix.arch }}
+      - name: Khadem checks
+        if: matrix.name == 'linux-x64'
+        run: |
+          npm run typecheck
+          npx vitest run tests/khadem
+      - run: npm run build
+      - name: Install rpmbuild
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+      - name: Package
+        shell: bash
+        run: npx electron-builder --config "$KHADEM_CONFIG" ${{ matrix.args }} --publish never
+      - name: Verify macOS native module architecture
+        if: runner.os == 'macOS'
+        run: |
+          APP=$(ls -d dist/mac*/Khadem.app | head -1)
+          file "$APP/Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node" | tee /dev/stderr | grep -q "${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.exists == 'false' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Merge macOS update metadata (x64 + arm64)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node <<'NODE'
+          const crypto = require("crypto"), fs = require("fs"), path = require("path");
+          const dir = path.join(process.cwd(), "artifacts"), version = process.env.VERSION;
+          const zips = fs.readdirSync(dir).filter((n) => n.includes(version) && n.endsWith("-mac.zip"))
+            .sort((a, b) => (a.includes("-x64-") ? -1 : b.includes("-x64-") ? 1 : a.localeCompare(b)));
+          if (!zips.length) { console.log("no macOS zips"); process.exit(0); }
+          const files = zips.map((url) => {
+            const p = path.join(dir, url);
+            return { url, sha512: crypto.createHash("sha512").update(fs.readFileSync(p)).digest("base64"), size: fs.statSync(p).size };
+          });
+          const primary = files[0];
+          const lines = [`version: ${version}`, "files:",
+            ...files.flatMap((f) => [`  - url: ${f.url}`, `    sha512: ${f.sha512}`, `    size: ${f.size}`]),
+            `path: ${primary.url}`, `sha512: ${primary.sha512}`, `releaseDate: '${new Date().toISOString()}'`, ""];
+          fs.writeFileSync(path.join(dir, "latest-mac.yml"), lines.join("\n"));
+          NODE
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: خادم Khadem Desktop ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            خادم — تطبيق سطح المكتب العربي لوكيل الذكاء الاصطناعي خادم.
+            Khadem Desktop — Arabic-first desktop app for the Khadem agent.
+
+            Builds are not code-signed yet: on macOS right-click → Open the first time; on Windows choose
+            "More info → Run anyway".
+          files: |
+            artifacts/*.AppImage
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.dmg
+            artifacts/*.zip
+            artifacts/*.exe
+            artifacts/*.blockmap
+            artifacts/latest*.yml

@@ -14,6 +14,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "$UPSTREAM_URL"
 git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+# .gitattributes marks Khadem brand assets `merge=ours`; register the driver it names.
+git config merge.ours.driver true
 
 before=$(git rev-parse HEAD)
 if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then

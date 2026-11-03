@@ -10,15 +10,24 @@ publish:
   provider: github
   owner: firothehero
   repo: khadem-desktop
+  releaseType: release
+win:
+  executableName: Khadem
+  icon: build/khadem/icon.ico
 nsis:
   shortcutName: Khadem
   uninstallDisplayName: Khadem
 mac:
   executableName: Khadem
+  icon: build/khadem/icon.icns
+  # Khadem has no Apple notarization credentials yet; set to true (and sign) once it does.
+  notarize: false
   # electron-builder concatenates extendInfo lists (base first); this later entry wins.
   extendInfo:
     - CFBundleDisplayName: خادم
 linux:
+  executableName: khadem
+  icon: build/khadem/icon.png
   vendor: Khadem
   synopsis: Arabic-first self-improving AI agent desktop app
   description: >-

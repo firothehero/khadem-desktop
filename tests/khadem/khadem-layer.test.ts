@@ -209,6 +209,25 @@ const LEDGER: Array<[string, string]> = [
   ["src/renderer/src/screens/Chat/ChatInput.tsx", 'dir="auto"'],
 ];
 
+describe("brand assets", () => {
+  it("keeps the Khadem app icon in resources/ protected from upstream merges", () => {
+    expect(readFileSync(join(ROOT, ".gitattributes"), "utf-8")).toContain(
+      "resources/icon.png merge=ours",
+    );
+    for (const icon of ["icon.png", "icon.icns", "icon.ico"]) {
+      expect(
+        readFileSync(join(ROOT, "build", "khadem", icon)).length,
+      ).toBeGreaterThan(1000);
+    }
+    const builder = readFileSync(
+      join(ROOT, "electron-builder.khadem.yml"),
+      "utf-8",
+    );
+    expect(builder).toContain("extends: ./electron-builder.yml");
+    expect(builder).toMatch(/owner: firothehero\s+repo: khadem-desktop/);
+  });
+});
+
 describe("patch ledger", () => {
   it.each(LEDGER)("%s still carries its Khadem hook", (file, marker) => {
     expect(readFileSync(join(ROOT, file), "utf-8")).toContain(marker);
