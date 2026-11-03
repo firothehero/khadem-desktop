@@ -66,6 +66,35 @@ describe("Preload API Surface", () => {
 // ─── New APIs exist ─────────────────────────────────────
 
 describe("New APIs from v0.8/v0.9 features", () => {
+  it("has chat approval APIs", () => {
+    expect(preloadMethods).toContain("onApprovalRequest");
+    expect(typeMethods).toContain("onApprovalRequest");
+    expect(preloadMethods).toContain("respondApproval");
+    expect(typeMethods).toContain("respondApproval");
+  });
+  it("has bounded Agent capability APIs", () => {
+    expect(preloadMethods).toContain("getAgentCapabilities");
+    expect(typeMethods).toContain("getAgentCapabilities");
+    expect(preloadMethods).toContain("recordAgentRuntimeInfo");
+    expect(typeMethods).toContain("recordAgentRuntimeInfo");
+    expect(preloadMethods).toContain("recordAgentCommandInventory");
+    expect(typeMethods).toContain("recordAgentCommandInventory");
+  });
+
+  it("has named connection registry APIs", () => {
+    for (const method of [
+      "getConnectionRegistry",
+      "getConnectionStatuses",
+      "createConnection",
+      "renameConnection",
+      "selectConnection",
+      "removeConnection",
+    ]) {
+      expect(preloadMethods).toContain(method);
+      expect(typeMethods).toContain(method);
+    }
+  });
+
   it("has backup/import APIs", () => {
     expect(preloadMethods).toContain("runHermesBackup");
     expect(preloadMethods).toContain("runHermesImport");
@@ -86,11 +115,51 @@ describe("New APIs from v0.8/v0.9 features", () => {
   it("has MCP server list API", () => {
     expect(preloadMethods).toContain("listMcpServers");
     expect(typeMethods).toContain("listMcpServers");
+    expect(preloadMethods).toContain("addMcpServer");
+    expect(typeMethods).toContain("addMcpServer");
+    expect(preloadMethods).toContain("removeMcpServer");
+    expect(typeMethods).toContain("removeMcpServer");
+    expect(preloadMethods).toContain("setMcpServerEnabled");
+    expect(typeMethods).toContain("setMcpServerEnabled");
+    expect(preloadMethods).toContain("testMcpServer");
+    expect(typeMethods).toContain("testMcpServer");
+    expect(preloadMethods).toContain("listMcpCatalog");
+    expect(typeMethods).toContain("listMcpCatalog");
+    expect(preloadMethods).toContain("installMcpCatalogEntry");
+    expect(typeMethods).toContain("installMcpCatalogEntry");
   });
 
   it("has memory provider discovery API", () => {
     expect(preloadMethods).toContain("discoverMemoryProviders");
     expect(typeMethods).toContain("discoverMemoryProviders");
+  });
+
+  it("has OAuth provider status API", () => {
+    expect(preloadMethods).toContain("getOAuthProviderStatuses");
+    expect(typeMethods).toContain("getOAuthProviderStatuses");
+  });
+
+  it("has dashboard transport probe APIs", () => {
+    expect(preloadMethods).toContain("dashboardStatus");
+    expect(typeMethods).toContain("dashboardStatus");
+    expect(preloadMethods).toContain("startDashboard");
+    expect(typeMethods).toContain("startDashboard");
+    expect(preloadMethods).toContain("stopDashboard");
+    expect(typeMethods).toContain("stopDashboard");
+    expect(preloadMethods).toContain("setConnectionChatTransports");
+    expect(typeMethods).toContain("setConnectionChatTransports");
+    expect(preloadMethods).toContain("probeRemoteAuthMode");
+    expect(typeMethods).toContain("probeRemoteAuthMode");
+    expect(preloadMethods).toContain("connectRemoteGateway");
+    expect(typeMethods).toContain("connectRemoteGateway");
+    expect(preloadMethods).toContain("remoteOAuthLogin");
+    expect(typeMethods).toContain("remoteOAuthLogin");
+    expect(preloadMethods).toContain("remoteOAuthLogout");
+    expect(typeMethods).toContain("remoteOAuthLogout");
+    expect(preloadMethods).toContain("remoteOAuthSessionState");
+    expect(typeMethods).toContain("remoteOAuthSessionState");
+    expect(preloadMethods).toContain("freshDashboardWsUrl");
+    expect(typeMethods).toContain("freshDashboardWsUrl");
   });
 });
 
@@ -119,19 +188,25 @@ describe("Legacy APIs preserved (backward compat)", () => {
     "sendMessage",
     "abortChat",
     "onChatChunk",
+    "onChatReasoningChunk",
     "onChatDone",
+    "onChatSessionStarted",
     "onChatToolProgress",
     "onChatUsage",
     "onChatError",
     // Gateway
     "startGateway",
     "stopGateway",
+    "restartGateway",
     "gatewayStatus",
     "getPlatformEnabled",
     "setPlatformEnabled",
     // Sessions
     "listSessions",
     "getSessionMessages",
+    "recordSessionContinuation",
+    "recordSessionLocalError",
+    "deleteSessions",
     // Profiles
     "listProfiles",
     "createProfile",
@@ -161,6 +236,7 @@ describe("Legacy APIs preserved (backward compat)", () => {
     "addModel",
     "removeModel",
     "updateModel",
+    "onModelLibraryChanged",
     // Credential pool
     "getCredentialPool",
     "setCredentialPool",
@@ -176,6 +252,7 @@ describe("Legacy APIs preserved (backward compat)", () => {
     "triggerCronJob",
     // Shell
     "openExternal",
+    "openTerminal",
   ];
 
   for (const method of requiredMethods) {

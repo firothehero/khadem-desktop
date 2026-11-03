@@ -1,4 +1,5 @@
 export default {
+  showEarlierMessages: "Mostrar {{count}} mensagens anteriores",
   title: "Novo Chat",
   sessionTitle: "Sessão {{id}}",
   noModel: "Nenhum modelo definido",
@@ -9,6 +10,7 @@ export default {
     "Pergunta Rápida (/btw) — pergunta lateral que não afectará o contexto da conversa",
   send: "Enviar",
   custom: "Personalizado",
+  searchModels: "Pesquisar modelos...",
   typeModelName: "Escreva o nome do modelo...",
   emptyTitle: "Como posso ajudá-lo hoje?",
   emptyHint:
@@ -23,16 +25,31 @@ export default {
   deny: "Negar",
   newChat: "Novo chat (Cmd+N)",
   clearChat: "Limpar chat",
+  setContextFolder: "Definir pasta de contexto",
+  contextFolderActive: "Pasta de contexto: {{path}}",
+  removeContextFolder: "Remover pasta de contexto",
   attach: "Anexar ficheiros",
   removeAttachment: "Remover anexo",
   dropToAttach: "Largue ficheiros para anexar",
   attachUnsupported: "{{name}}: tipo de ficheiro não suportado",
-  attachImageTooLarge: "{{name}}: imagem demasiado grande (máx. 20 MB)",
+  attachImageTooLarge: "{{name}}: imagem demasiado grande (máx. 50 MB)",
+  attachImageUncompressible:
+    "{{name}}: não foi possível comprimir a imagem para caber (GIF animado ou formato não suportado). Tenta uma captura de ecrã estática.",
   attachTextTooLarge: "{{name}}: ficheiro demasiado grande (máx. 256 KB)",
   attachTooMany: "Demasiados anexos (máx. 10 por mensagem)",
   attachReadFailed: "{{name}}: não foi possível ler",
   attachRemoteModeBinary:
     "{{name}}: anexos PDF/binários exigem o modo local — imagens e ficheiros de texto continuam a funcionar.",
+  validation: {
+    noModel:
+      "Nenhum modelo seleccionado. Escolha um no selector de Chat em baixo.",
+    noProvider: "Sem fornecedor definido para o modelo activo.",
+    missingKey: "Falta {{key}} — exigida pelo fornecedor activo.",
+    fixInProviders: "Defina em Fornecedores →",
+    fixInModels: "Escolha um modelo em Modelos →",
+    fixInGateway: "Verifique o separador Gateway →",
+    fixInSetup: "Executar configuração →",
+  },
   fastMode: "Modo Rápido",
   fastModeOn: "Modo Rápido LIGADO",
   fastModeActive:
@@ -45,6 +62,11 @@ export default {
   categoryTools: "Ferramentas",
   categoryInfo: "Informação",
   noUsageData: "Ainda sem dados de utilização. Envie uma mensagem primeiro.",
+  media: {
+    open: "Abrir",
+    saveAs: "Guardar como…",
+    saveImage: "Guardar imagem",
+  },
   commands: {
     new: "Iniciar um novo chat",
     clear: "Limpar o histórico da conversa",
@@ -69,5 +91,32 @@ export default {
     memory: "Mostrar a memória do agente",
     persona: "Mostrar a persona atual",
     version: "Mostrar a versão do Hermes",
+  },
+  queued:
+    "{{count}} mensagem(ns) em fila — serão enviadas quando o agente terminar",
+  queuedCancel: "Remover da fila",
+  copyMessage: "Copiar mensagem",
+  subagents: {
+    title: "{{count}} subagente(s) em execução",
+    untitled: "Tarefa do subagente",
+    queued: "Em fila",
+    waitingActivity: "A aguardar atividade…",
+    transcript: "Saída em direto",
+    transcriptUnavailable: "Saída em direto indisponível",
+    transcriptTruncated: "A mostrar a saída mais recente",
+    steerPlaceholder: "Enviar orientação a este subagente",
+    steer: "Orientar",
+    steerQueued: "Orientação em fila",
+    stop: "Parar",
+    stopRequested: "Paragem solicitada",
+    requestRejected: "O subagente não aceitou esse pedido",
+  },
+  worktree: {
+    loading: "A carregar",
+    empty: "A pasta está vazia",
+    emptyFolder: "Pasta vazia",
+    errorLoading: "Falha ao carregar conteúdo da pasta",
+    openTerminal: "Abrir terminal aqui",
+    openTerminalFailed: "Não foi possível abrir um terminal para esta pasta.",
   },
 } as const;

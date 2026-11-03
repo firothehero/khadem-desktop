@@ -3,13 +3,60 @@ export default {
   sections: {
     hermesAgent: "Hermes Agent",
     appearance: "Aparência",
+    privacy: "Privacidade",
     credentialPool: "Pool de Credenciais",
+  },
+  nav: {
+    groups: {
+      general: "Geral",
+      hermes: "Hermes One",
+    },
+    appearance: "Aparência",
+    language: "Idioma",
+    pets: "Mascotes",
+    privacy: "Privacidade",
+    connection: "Conexão",
+    network: "Rede",
+    data: "Dados",
+    about: "Sobre e atualizações",
+    community: "Comunidade",
+    logs: "Registros e diagnósticos",
+  },
+  analytics: {
+    label: "Enviar análises de uso anônimas",
+    hint: "Ajuda a melhorar o Hermes enviando dados de uso anônimos e agregados para o serviço de análise do projeto. Você pode desativar a qualquer momento.",
+    disclosure: {
+      uuid: "Um identificador aleatório por instalação armazenado apenas neste dispositivo (sem nome, e-mail ou dados de conta).",
+      platform:
+        "Seu sistema operacional, versão do Electron e versão do Node.js.",
+      navigation:
+        "Quais telas você abre dentro do app (ex.: Chat, Sessões, Configurações). Conteúdo de chats, prompts, respostas do modelo e conteúdo de arquivos não são coletados.",
+      endpoint:
+        "Os dados são enviados para o serviço de análise do Hermes (analytics.hermesone.org). Gravações de sessão e captura automática de pageviews estão desativadas.",
+      notCollected:
+        "Nunca coletado: mensagens de chat, caminhos de arquivos, chaves de API, configuração do modelo, credenciais de conta.",
+    },
   },
   theme: {
     label: "Tema",
     system: "Sistema",
     light: "Claro",
     dark: "Escuro",
+  },
+  pet: {
+    label: "Mascotes",
+    hint: "Compartilhadas com o Hermes Agent e o desktop oficial neste perfil. Escolha uma mascote para instalar e ativar.",
+    loading: "Carregando mascotes…",
+    enabled: "Mostrar mascote",
+    scale: "Tamanho",
+    search: "Pesquisar mascotes",
+    active: "Ativa",
+    installed: "Instalada",
+    adopt: "Adotar",
+    rename: "Renomear",
+    export: "Exportar",
+    remove: "Remover",
+    confirmRemove: "Remover {{name}} deste perfil?",
   },
   language: {
     label: "Idioma",
@@ -44,7 +91,8 @@ export default {
     "Nome do modelo padrão (deixe em branco para usar o padrão do provedor)",
   refreshModels: "Atualizar lista de modelos",
   discoveringModels: "Carregando modelos disponíveis…",
-  discoveredCount: "{{count}} modelos disponíveis — comece a digitar para filtrar",
+  discoveredCount:
+    "{{count}} modelos disponíveis — comece a digitar para filtrar",
   discoveryNoKey:
     "Defina a chave de API deste provedor no .env para carregar a lista de modelos disponíveis",
   discoveryError:

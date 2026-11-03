@@ -17,6 +17,7 @@ export default {
   },
   localPresets: {
     lmstudio: "LM Studio",
+    atomicchat: "Atomic Chat",
     ollama: "Ollama",
     vllm: "vLLM",
     llamacpp: "llama.cpp",
@@ -25,6 +26,8 @@ export default {
     together: "Together AI",
     fireworks: "Fireworks",
     cerebras: "Cerebras",
+    requesty: "Requesty",
+    api_route: "API Route",
     mistral: "Mistral",
   },
   serverPreset: "Preajuste de servidor",

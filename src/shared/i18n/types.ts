@@ -1,11 +1,15 @@
 export type AppLocale =
-  | "ar"
   | "en"
+  | "ar"
   | "es"
+  | "fa"
+  | "he"
   | "id"
   | "ja"
+  | "pl"
   | "pt-BR"
   | "pt-PT"
+  | "tr"
   | "zh-CN"
   | "zh-TW";
 

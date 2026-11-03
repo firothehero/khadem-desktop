@@ -1,3 +1,4 @@
+import { memoryProviderDiscoveryScript } from "./memory-provider-discovery";
 /**
  * SSH-proxied implementations of all hermes operations.
  * Used when connection mode is "ssh" — every feature that normally reads/writes
@@ -5,17 +6,45 @@
  */
 
 import { spawn } from "child_process";
+import { SSH_SESSION_DELETE_SCRIPT } from "./ssh-session-delete";
+import { SSH_SESSION_LIST_SCRIPT } from "./session-conversation";
+import { buildSshRemoteCommand } from "./ssh-command";
 import { homedir } from "os";
 import { join } from "path";
+import { existsSync } from "fs";
+import {
+  REMOTE_ENV_UPDATE_SCRIPT,
+  type RemoteEnvUpdate,
+  type RemoteEnvUpdateResult,
+} from "./ssh-env-update";
 import type { SshConfig } from "./ssh-tunnel";
+import type { KanbanTask } from "./kanban";
 import { buildSshControlOptions } from "./ssh-options";
-import type { InstalledSkill, SkillSearchResult } from "./skills";
+import {
+  classifySkillCliOutput,
+  type InstalledSkill,
+  type SkillSearchResult,
+} from "./skills";
 import type { MemoryInfo } from "./memory";
-import type { SessionSummary, SessionMessage, SearchResult } from "./sessions";
+import type {
+  HistoryItem,
+  SessionSummary,
+  SearchResult,
+  DeleteSessionsResult,
+} from "./sessions";
 import type { CachedSession } from "./session-cache";
+import type { Attachment } from "../shared/attachments";
+import { isImageMime, MAX_IMAGE_BYTES } from "../shared/attachments";
+import { normalizeModelEndpointUrl } from "../shared/model-endpoint";
 import type { ToolsetInfo } from "./tools";
+import {
+  extractLeadingVisionImageFallback,
+  stripTrailingImagePlaceholders,
+} from "./session-attachment-store";
+import { DEFAULT_MESSAGING_PLATFORM_TOOLSETS } from "../shared/messaging-platforms";
 import type { SavedModel } from "./models";
 import type { MemoryProviderInfo } from "./installer";
+import { parseMemoryLimitsConfig, type MemoryLimits } from "./memory-limits";
 import { t } from "../shared/i18n";
 import { getAppLocale } from "./locale";
 import { HIDDEN_SUBPROCESS_OPTIONS } from "./process-options";
@@ -47,10 +76,19 @@ export function sshExec(
   timeoutMs = 30000,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("ssh", [...buildExecArgs(config), command], {
-      stdio: ["pipe", "pipe", "pipe"],
-      ...HIDDEN_SUBPROCESS_OPTIONS,
-    });
+    const keyPath = config.keyPath?.trim() || join(homedir(), ".ssh", "id_rsa");
+    if (!existsSync(keyPath)) {
+      return reject(new Error(`SSH private key file not found at: ${keyPath}`));
+    }
+
+    const child = spawn(
+      "ssh",
+      [...buildExecArgs(config), buildSshRemoteCommand(command)],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        ...HIDDEN_SUBPROCESS_OPTIONS,
+      },
+    );
     let stdout = "";
     let stderr = "";
     const timeout = setTimeout(() => {
@@ -67,7 +105,15 @@ export function sshExec(
     });
     child.on("error", (err) => {
       clearTimeout(timeout);
-      reject(err);
+      if (err && "code" in err && err.code === "ENOENT") {
+        reject(
+          new Error(
+            "System SSH binary not found on your system PATH. Please ensure an SSH client is installed.",
+          ),
+        );
+      } else {
+        reject(err);
+      }
     });
     child.on("close", (code) => {
       clearTimeout(timeout);
@@ -116,7 +162,7 @@ function sanitizeSshError(stderr: string): string {
   return cleaned;
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
 
@@ -128,6 +174,62 @@ function pythonJsonInput(payload: unknown): string {
   return JSON.stringify(payload);
 }
 
+export interface SshDirectoryEntry {
+  name: string;
+  isDirectory: boolean;
+}
+
+export async function sshReadDirectory(
+  config: SshConfig,
+  remotePath: string,
+): Promise<SshDirectoryEntry[] | null> {
+  const script = `
+import json
+import os
+import sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+raw = str(payload.get("path") or "")
+if raw.startswith("~/"):
+    raw = os.path.join(os.path.expanduser("~"), raw[2:])
+elif raw.startswith("$HOME/"):
+    raw = os.path.join(os.path.expanduser("~"), raw[6:])
+path = os.path.abspath(os.path.expanduser(raw or "."))
+rows = []
+for entry in os.scandir(path):
+    rows.append({
+        "name": entry.name,
+        "isDirectory": entry.is_dir(follow_symlinks=False),
+    })
+rows.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
+print(json.dumps(rows))
+`;
+
+  try {
+    const out = await sshPython(
+      config,
+      script,
+      pythonJsonInput({ path: remotePath }),
+    );
+    const parsed = JSON.parse(out);
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .filter(
+        (entry): entry is SshDirectoryEntry =>
+          entry !== null &&
+          typeof entry === "object" &&
+          typeof entry.name === "string" &&
+          typeof entry.isDirectory === "boolean",
+      )
+      .map((entry) => ({
+        name: entry.name,
+        isDirectory: entry.isDirectory,
+      }));
+  } catch {
+    return null;
+  }
+}
+
 async function sshReadFile(
   config: SshConfig,
   remotePath: string,
@@ -135,7 +237,7 @@ async function sshReadFile(
   try {
     return await sshExec(
       config,
-      `bash -c 'case "$1" in "~/"*) p="$HOME/\${1#~/}" ;; "\\$HOME/"*) p="$HOME/\${1#\\$HOME/}" ;; *) p="$1" ;; esac; cat -- "$p" 2>/dev/null || true' -- ${shellQuote(normalizeRemotePath(remotePath))}`,
+      `sh -c 'case "$1" in "~/"*) p="$HOME/\${1#~/}" ;; "\\$HOME/"*) p="$HOME/\${1#\\$HOME/}" ;; *) p="$1" ;; esac; cat -- "$p" 2>/dev/null || true' -- ${shellQuote(normalizeRemotePath(remotePath))}`,
     );
   } catch {
     return "";
@@ -151,7 +253,7 @@ async function sshWriteFile(
   const dir = p.includes("/") ? p.substring(0, p.lastIndexOf("/")) : ".";
   await sshExec(
     config,
-    `bash -c 'expand(){ case "$1" in "~/"*) printf "%s" "$HOME/\${1#~/}" ;; "\\$HOME/"*) printf "%s" "$HOME/\${1#\\$HOME/}" ;; *) printf "%s" "$1" ;; esac; }; dir=$(expand "$1"); file=$(expand "$2"); mkdir -p -- "$dir" && cat > "$file"' -- ${shellQuote(dir)} ${shellQuote(p)}`,
+    `sh -c 'expand(){ case "$1" in "~/"*) printf "%s" "$HOME/\${1#~/}" ;; "\\$HOME/"*) printf "%s" "$HOME/\${1#\\$HOME/}" ;; *) printf "%s" "$1" ;; esac; }; dir=$(expand "$1"); file=$(expand "$2"); mkdir -p -- "$dir" && cat > "$file"' -- ${shellQuote(dir)} ${shellQuote(p)}`,
     content,
   );
 }
@@ -236,13 +338,13 @@ export async function sshInstallSkill(
   identifier: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await sshExec(
+    const stdout = await sshExec(
       config,
-      `hermes skills install ${shellQuote(identifier)} --yes 2>&1`,
+      buildRemoteHermesCmd(["skills", "install", identifier, "--yes"], " 2>&1"),
       undefined,
       120000,
     );
-    return { success: true };
+    return classifySkillCliOutput(stdout ?? "");
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
@@ -253,7 +355,59 @@ export async function sshUninstallSkill(
   name: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await sshExec(config, `hermes skills uninstall ${shellQuote(name)} 2>&1`);
+    const stdout = await sshExec(
+      config,
+      buildRemoteHermesCmd(["skills", "uninstall", name, "--yes"], " 2>&1"),
+    );
+    const result = classifySkillCliOutput(stdout ?? "");
+    if (result.success) return result;
+
+    // CLI didn't find it — try direct filesystem removal on the remote.
+    // Walk ~/.hermes/skills/*/ to find a directory whose SKILL.md frontmatter
+    // name or directory basename matches `name`.
+    await sshExec(
+      config,
+      `python3 -c '
+import os, sys
+name = ${shellQuote(name)}
+home = os.path.expanduser("~")
+skills_dir = os.path.join(home, ".hermes", "skills")
+if not os.path.isdir(skills_dir):
+    sys.exit(0)
+for cat in os.listdir(skills_dir):
+    cat_path = os.path.join(skills_dir, cat)
+    if not os.path.isdir(cat_path):
+        continue
+    for entry in os.listdir(cat_path):
+        entry_path = os.path.join(cat_path, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        skill_file = os.path.join(entry_path, "SKILL.md")
+        if not os.path.isfile(skill_file):
+            continue
+        skill_name = entry
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                lines = f.read(4000).splitlines()
+            in_fm = False
+            for line in lines:
+                if line.strip() == "---":
+                    if not in_fm:
+                        in_fm = True
+                        continue
+                    else:
+                        break
+                if in_fm and line.strip().startswith("name:"):
+                    skill_name = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+        except Exception:
+            pass
+        if skill_name == name or entry == name:
+            import shutil
+            shutil.rmtree(entry_path)
+            sys.exit(0)
+' 2>&1`,
+    );
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };
@@ -267,7 +421,10 @@ export async function sshSearchSkills(
   try {
     const out = await sshExec(
       config,
-      `hermes skills browse --query ${shellQuote(query)} --json 2>/dev/null || echo "[]"`,
+      `${buildRemoteHermesCmd(
+        ["skills", "browse", "--query", query, "--json"],
+        " 2>/dev/null",
+      )} || echo "[]"`,
     );
     const parsed = JSON.parse(out.trim() || "[]");
     if (Array.isArray(parsed)) {
@@ -294,8 +451,6 @@ export async function sshListBundledSkills(
 // ── Memory ───────────────────────────────────────────────────────────────────
 
 const ENTRY_DELIMITER = "\n§\n";
-const MEMORY_CHAR_LIMIT = 2200;
-const USER_CHAR_LIMIT = 1375;
 
 function parseMemoryEntries(
   content: string,
@@ -325,6 +480,14 @@ function remoteUserPath(profile?: string): string {
     return `~/.hermes/profiles/${profile}/memories/USER.md`;
   }
   return "~/.hermes/memories/USER.md";
+}
+
+async function sshReadMemoryLimits(
+  config: SshConfig,
+  profile?: string,
+): Promise<MemoryLimits> {
+  const content = await sshReadFile(config, remoteConfigPath(profile));
+  return parseMemoryLimitsConfig(content);
 }
 
 async function sshGetSessionStats(
@@ -361,9 +524,12 @@ export async function sshReadMemory(
   config: SshConfig,
   profile?: string,
 ): Promise<MemoryInfo> {
-  const memContent = await sshReadFile(config, remoteMemoryPath(profile));
-  const userContent = await sshReadFile(config, remoteUserPath(profile));
-  const stats = await sshGetSessionStats(config, profile);
+  const [memContent, userContent, stats, limits] = await Promise.all([
+    sshReadFile(config, remoteMemoryPath(profile)),
+    sshReadFile(config, remoteUserPath(profile)),
+    sshGetSessionStats(config, profile),
+    sshReadMemoryLimits(config, profile),
+  ]);
 
   return {
     memory: {
@@ -372,14 +538,14 @@ export async function sshReadMemory(
       lastModified: null,
       entries: parseMemoryEntries(memContent),
       charCount: memContent.length,
-      charLimit: MEMORY_CHAR_LIMIT,
+      charLimit: limits.memoryCharLimit,
     },
     user: {
       content: userContent,
       exists: userContent.length > 0,
       lastModified: null,
       charCount: userContent.length,
-      charLimit: USER_CHAR_LIMIT,
+      charLimit: limits.userCharLimit,
     },
     stats,
   };
@@ -390,16 +556,19 @@ export async function sshAddMemoryEntry(
   content: string,
   profile?: string,
 ): Promise<{ success: boolean; error?: string }> {
-  const current = await sshReadFile(config, remoteMemoryPath(profile));
+  const [current, limits] = await Promise.all([
+    sshReadFile(config, remoteMemoryPath(profile)),
+    sshReadMemoryLimits(config, profile),
+  ]);
   const entries = parseMemoryEntries(current);
   const newContent = serializeEntries([
     ...entries,
     { index: entries.length, content: content.trim() },
   ]);
-  if (newContent.length > MEMORY_CHAR_LIMIT) {
+  if (newContent.length > limits.memoryCharLimit) {
     return {
       success: false,
-      error: `Would exceed memory limit (${newContent.length}/${MEMORY_CHAR_LIMIT} chars)`,
+      error: `Would exceed memory limit (${newContent.length}/${limits.memoryCharLimit} chars)`,
     };
   }
   await sshWriteFile(config, remoteMemoryPath(profile), newContent);
@@ -412,16 +581,19 @@ export async function sshUpdateMemoryEntry(
   content: string,
   profile?: string,
 ): Promise<{ success: boolean; error?: string }> {
-  const current = await sshReadFile(config, remoteMemoryPath(profile));
+  const [current, limits] = await Promise.all([
+    sshReadFile(config, remoteMemoryPath(profile)),
+    sshReadMemoryLimits(config, profile),
+  ]);
   const entries = parseMemoryEntries(current);
   if (index < 0 || index >= entries.length)
     return { success: false, error: "Entry not found" };
   entries[index] = { ...entries[index], content: content.trim() };
   const newContent = serializeEntries(entries);
-  if (newContent.length > MEMORY_CHAR_LIMIT) {
+  if (newContent.length > limits.memoryCharLimit) {
     return {
       success: false,
-      error: `Would exceed memory limit (${newContent.length}/${MEMORY_CHAR_LIMIT} chars)`,
+      error: `Would exceed memory limit (${newContent.length}/${limits.memoryCharLimit} chars)`,
     };
   }
   await sshWriteFile(config, remoteMemoryPath(profile), newContent);
@@ -450,10 +622,11 @@ export async function sshWriteUserProfile(
   content: string,
   profile?: string,
 ): Promise<{ success: boolean; error?: string }> {
-  if (content.length > USER_CHAR_LIMIT) {
+  const limits = await sshReadMemoryLimits(config, profile);
+  if (content.length > limits.userCharLimit) {
     return {
       success: false,
-      error: `Exceeds limit (${content.length}/${USER_CHAR_LIMIT} chars)`,
+      error: `Exceeds limit (${content.length}/${limits.userCharLimit} chars)`,
     };
   }
   await sshWriteFile(config, remoteUserPath(profile), content);
@@ -573,36 +746,48 @@ const TOOLSET_DEFS = [
   },
 ];
 
-function parseEnabledToolsets(content: string): Set<string> {
-  const enabled = new Set<string>();
+function parsePlatformToolsets(content: string): Record<string, Set<string>> {
+  const toolsets: Record<string, Set<string>> = {};
   let inPlatformToolsets = false;
-  let inCli = false;
+  let currentPlatform: string | null = null;
   for (const line of content.split("\n")) {
     const trimmed = line.trimEnd();
     if (/^\s*platform_toolsets\s*:/.test(trimmed)) {
       inPlatformToolsets = true;
-      inCli = false;
+      currentPlatform = null;
       continue;
     }
-    if (inPlatformToolsets && /^\s+cli\s*:/.test(trimmed)) {
-      inCli = true;
-      continue;
-    }
-    if (inPlatformToolsets && /^\S/.test(trimmed) && !/^\s*$/.test(trimmed)) {
+    if (inPlatformToolsets && /^\S/.test(trimmed) && trimmed !== "") {
       inPlatformToolsets = false;
-      inCli = false;
+      currentPlatform = null;
       continue;
     }
-    if (inCli && /^\s{4}\S/.test(trimmed) && !/^\s{4,}-/.test(trimmed)) {
-      inCli = false;
+    if (!inPlatformToolsets) continue;
+
+    const platformMatch = trimmed.match(
+      /^\s+([A-Za-z0-9_-]+)\s*:\s*(\[\])?\s*(?:#.*)?$/,
+    );
+    if (platformMatch) {
+      const platformName = platformMatch[1];
+      currentPlatform = platformMatch[2] ? null : platformName;
+      toolsets[platformName] ??= new Set<string>();
       continue;
     }
-    if (inCli) {
-      const m = trimmed.match(/^\s+-\s+["']?(\w+)["']?/);
-      if (m) enabled.add(m[1]);
+
+    if (currentPlatform) {
+      const m = trimmed.match(/^\s+-\s+["']?([A-Za-z0-9_-]+)["']?/);
+      if (m) toolsets[currentPlatform].add(m[1]);
     }
   }
-  return enabled;
+  return toolsets;
+}
+
+function parseEnabledToolsets(content: string, platform = "cli"): Set<string> {
+  return parsePlatformToolsets(content)[platform] ?? new Set<string>();
+}
+
+function isSafeToolsetConfigKey(key: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(key);
 }
 
 function localizeToolDefs(
@@ -635,18 +820,70 @@ export async function sshGetToolsets(
   return localizeToolDefs((key) => enabled.has(key));
 }
 
+export async function sshGetPlatformToolsets(
+  config: SshConfig,
+  profile?: string,
+): Promise<Record<string, string[]>> {
+  const content = await sshReadFile(config, remoteConfigPath(profile));
+  if (!content) return {};
+  return Object.fromEntries(
+    Object.entries(parsePlatformToolsets(content)).map(([platform, values]) => [
+      platform,
+      Array.from(values).sort(),
+    ]),
+  );
+}
+
 export async function sshSetToolsetEnabled(
   config: SshConfig,
   key: string,
   enabled: boolean,
   profile?: string,
 ): Promise<boolean> {
+  return sshSetPlatformToolsetEnabled(config, "cli", key, enabled, profile);
+}
+
+export async function sshSetMessagingPlatformToolsetEnabled(
+  config: SshConfig,
+  platform: string,
+  key: string,
+  enabled: boolean,
+  profile?: string,
+): Promise<boolean> {
+  return sshSetPlatformToolsetEnabled(
+    config,
+    platform,
+    key,
+    enabled,
+    profile,
+    DEFAULT_MESSAGING_PLATFORM_TOOLSETS,
+  );
+}
+
+async function sshSetPlatformToolsetEnabled(
+  config: SshConfig,
+  platform: string,
+  key: string,
+  enabled: boolean,
+  profile?: string,
+  defaultEnabled: string[] = [],
+): Promise<boolean> {
   try {
+    if (!isSafeToolsetConfigKey(platform) || !isSafeToolsetConfigKey(key)) {
+      return false;
+    }
     const configPath = remoteConfigPath(profile);
     const content = await sshReadFile(config, configPath);
     if (!content) return false;
 
-    const current = parseEnabledToolsets(content);
+    const parsed = parsePlatformToolsets(content);
+    const hasPlatformConfig = Object.prototype.hasOwnProperty.call(
+      parsed,
+      platform,
+    );
+    const current = hasPlatformConfig
+      ? new Set(parsed[platform])
+      : new Set(defaultEnabled);
     if (enabled) current.add(key);
     else current.delete(key);
 
@@ -654,14 +891,15 @@ export async function sshSetToolsetEnabled(
       .sort()
       .map((t) => `      - ${t}`)
       .join("\n");
-    const newSection = `  cli:\n${toolsetLines}`;
+    const newSection = `  ${platform}:\n${toolsetLines}`;
+    const platformHeader = new RegExp(`^\\s+${platform}\\s*:`);
 
     let newContent: string;
     if (content.includes("platform_toolsets")) {
       const lines = content.split("\n");
       const result: string[] = [];
       let inPT = false,
-        inCli = false,
+        inTargetPlatform = false,
         inserted = false;
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
@@ -671,15 +909,15 @@ export async function sshSetToolsetEnabled(
           result.push(line);
           continue;
         }
-        if (inPT && /^\s+cli\s*:/.test(trimmed)) {
-          inCli = true;
+        if (inPT && platformHeader.test(trimmed)) {
+          inTargetPlatform = true;
           result.push(newSection);
           inserted = true;
           continue;
         }
-        if (inCli) {
+        if (inTargetPlatform) {
           if (/^\s+-\s/.test(trimmed)) continue;
-          inCli = false;
+          inTargetPlatform = false;
           result.push(line);
           continue;
         }
@@ -687,9 +925,13 @@ export async function sshSetToolsetEnabled(
           inPT = false;
           if (!inserted) {
             result.push(newSection);
+            inserted = true;
           }
         }
         result.push(line);
+      }
+      if (inPT && !inserted) {
+        result.push(newSection);
       }
       newContent = result.join("\n");
     } else {
@@ -750,32 +992,102 @@ export async function sshReadEnv(
   return result;
 }
 
+/**
+ * Boolean-only OAuth credential probe for SSH hosts that cannot serve the
+ * dashboard API. The Python process reads remote auth.json stores and emits no
+ * credential material. Named profiles inherit the default store just like the
+ * local hasOAuthCredentials helper.
+ */
+export async function sshGetOAuthProviderStatuses(
+  config: SshConfig,
+  providers: readonly string[],
+  profile?: string,
+): Promise<Record<string, boolean>> {
+  const requested = (profile || "default").trim() || "default";
+  if (
+    requested !== "default" &&
+    !/^[a-z0-9_][a-z0-9_-]{0,63}$/.test(requested)
+  ) {
+    throw new Error("Invalid SSH profile name.");
+  }
+
+  const script = String.raw`
+import json
+import pathlib
+import sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+providers = [item for item in payload.get("providers", []) if isinstance(item, str)]
+profile = str(payload.get("profile") or "default")
+root = pathlib.Path.home() / ".hermes"
+paths = [root / "auth.json"]
+if profile != "default":
+    paths.insert(0, root / "profiles" / profile / "auth.json")
+
+stores = []
+for path in paths:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        stores.append(value if isinstance(value, dict) else {})
+    except Exception:
+        stores.append({})
+
+def usable(entry):
+    if not isinstance(entry, dict):
+        return False
+    return any(str(entry.get(key) or "").strip() for key in (
+        "access_token", "refresh_token", "api_key"
+    ))
+
+result = {}
+for provider in providers:
+    found = False
+    for store in stores:
+        direct = store.get("providers", {})
+        if isinstance(direct, dict) and usable(direct.get(provider)):
+            found = True
+            break
+        pool = store.get("credential_pool", {})
+        entries = pool.get(provider, []) if isinstance(pool, dict) else []
+        if isinstance(entries, list) and any(usable(entry) for entry in entries):
+            found = True
+            break
+    result[provider] = found
+
+print(json.dumps(result))
+`;
+
+  const out = await sshPython(
+    config,
+    script,
+    JSON.stringify({ providers, profile: requested }),
+  );
+  const parsed = JSON.parse(out.trim() || "{}") as Record<string, unknown>;
+  return Object.fromEntries(
+    providers.map((provider) => [provider, parsed[provider] === true]),
+  );
+}
+
+async function sshUpdateEnv(
+  config: SshConfig,
+  update: RemoteEnvUpdate,
+  profile?: string,
+): Promise<RemoteEnvUpdateResult> {
+  const output = await sshPython(
+    config,
+    REMOTE_ENV_UPDATE_SCRIPT,
+    JSON.stringify({ path: remoteEnvPath(profile), ...update }),
+  );
+  return JSON.parse(output) as RemoteEnvUpdateResult;
+}
+
 export async function sshSetEnvValue(
   config: SshConfig,
   key: string,
   value: string,
   profile?: string,
 ): Promise<void> {
-  const envPath = remoteEnvPath(profile);
-  const content = await sshReadFile(config, envPath);
-
-  if (!content.trim()) {
-    await sshWriteFile(config, envPath, `${key}=${value}\n`);
-    return;
-  }
-
-  const lines = content.split("\n");
-  let found = false;
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim().match(new RegExp(`^#?\\s*${escaped}\\s*=`))) {
-      lines[i] = `${key}=${value}`;
-      found = true;
-      break;
-    }
-  }
-  if (!found) lines.push(`${key}=${value}`);
-  await sshWriteFile(config, envPath, lines.join("\n"));
+  await sshUpdateEnv(config, { operation: "set", key, value }, profile);
 }
 
 // ─── Dotted-path YAML helpers (mirror of the local-mode fix) ───────────────
@@ -1012,17 +1324,36 @@ export function sshGetHermesHome(_config: SshConfig, profile?: string): string {
 export async function sshGetModelConfig(
   config: SshConfig,
   profile?: string,
-): Promise<{ provider: string; model: string; baseUrl: string }> {
+): Promise<{
+  provider: string;
+  model: string;
+  baseUrl: string;
+  contextLength?: number;
+}> {
   // Use dotted paths so the lookup is scoped to the `model:` block. The
   // previous flat keys `provider` / `default` / `base_url` would each
   // match the first occurrence at any indent — typically picking up
   // `personalities.default` or `auxiliary.vision.provider` and reporting
   // them as the model fields (#240).
+  // Read once: each sshReadFile is a real SSH process, so fetching four
+  // sibling fields independently adds avoidable latency to every model read.
+  const content = await sshReadFile(config, remoteConfigPath(profile));
+  const read = (key: string): string =>
+    (content && locateInYaml(content, key)?.value) || "";
+  const rawContextLength = read("model.context_length").trim();
+  const parsedContextLength = rawContextLength
+    ? Number(rawContextLength)
+    : Number.NaN;
+  const contextLength =
+    Number.isFinite(parsedContextLength) && parsedContextLength > 0
+      ? Math.floor(parsedContextLength)
+      : undefined;
+
   return {
-    provider:
-      (await sshGetConfigValue(config, "model.provider", profile)) || "auto",
-    model: (await sshGetConfigValue(config, "model.default", profile)) || "",
-    baseUrl: (await sshGetConfigValue(config, "model.base_url", profile)) || "",
+    provider: read("model.provider") || "auto",
+    model: read("model.default"),
+    baseUrl: read("model.base_url"),
+    ...(contextLength !== undefined ? { contextLength } : {}),
   };
 }
 
@@ -1058,43 +1389,46 @@ export async function sshSetModelConfig(
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 
+export async function sshDeleteSessions(
+  config: SshConfig,
+  sessionIds: string[],
+  profile?: string,
+): Promise<DeleteSessionsResult> {
+  const output = await sshPython(
+    config,
+    SSH_SESSION_DELETE_SCRIPT,
+    pythonJsonInput({ sessionIds, profile }),
+  );
+  const result = JSON.parse(output.trim()) as DeleteSessionsResult;
+  if (
+    !Number.isInteger(result.requested) ||
+    !Number.isInteger(result.deleted) ||
+    result.deleted < 0 ||
+    result.deleted > result.requested
+  ) {
+    throw new Error("Invalid SSH session deletion response");
+  }
+  return result;
+}
+
+export async function sshDeleteSession(
+  config: SshConfig,
+  sessionId: string,
+  profile?: string,
+): Promise<void> {
+  await sshDeleteSessions(config, [sessionId], profile);
+}
+
 export async function sshListSessions(
   config: SshConfig,
   limit = 30,
   offset = 0,
   profile?: string,
 ): Promise<SessionSummary[]> {
-  const script = `
-import sqlite3, json, os, sys
-payload = json.load(sys.stdin)
-profile = payload.get("profile")
-limit = max(1, min(200, int(payload.get("limit") or 30)))
-offset = max(0, int(payload.get("offset") or 0))
-db = os.path.expanduser(f"~/.hermes/profiles/{profile}/state.db" if profile and profile != "default" else "~/.hermes/state.db")
-if not os.path.exists(db):
-    print("[]"); sys.exit(0)
-conn = sqlite3.connect(db)
-conn.row_factory = sqlite3.Row
-rows = conn.execute(
-    "SELECT id, source, started_at, ended_at, message_count, model, title "
-    "FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-    (limit, offset)
-).fetchall()
-result = []
-for r in rows:
-    result.append({
-        "id": r["id"], "source": r["source"] or "cli",
-        "startedAt": r["started_at"], "endedAt": r["ended_at"],
-        "messageCount": r["message_count"] or 0, "model": r["model"] or "",
-        "title": r["title"], "preview": ""
-    })
-print(json.dumps(result))
-conn.close()
-`;
   try {
     const out = await sshPython(
       config,
-      script,
+      SSH_SESSION_LIST_SCRIPT,
       pythonJsonInput({ profile, limit, offset }),
     );
     return JSON.parse(out.trim() || "[]");
@@ -1107,7 +1441,12 @@ export async function sshGetSessionMessages(
   config: SshConfig,
   sessionId: string,
   profile?: string,
-): Promise<SessionMessage[]> {
+): Promise<HistoryItem[]> {
+  // Mirror the local getSessionMessages logic over SSH: widen the SELECT to
+  // include tool_calls / tool_name / tool_call_id / reasoning columns, then
+  // expand each row into one or more HistoryItem entries. Kept inline in
+  // Python for transport simplicity. See src/main/sessions.ts for the
+  // canonical implementation and column documentation.
   const script = `
 import sqlite3, json, os, sys
 payload = json.load(sys.stdin)
@@ -1118,11 +1457,108 @@ if not os.path.exists(db):
     print("[]"); sys.exit(0)
 conn = sqlite3.connect(db)
 conn.row_factory = sqlite3.Row
+
+CONTENT_JSON_PREFIX = "\\x00json:"
+
+def decode(raw):
+    """Mirror src/main/sessions.ts::decodeContent — strip multimodal
+    sentinel, concat text parts, ignore images here (SSH path drops
+    attachments)."""
+    if not raw or not raw.startswith(CONTENT_JSON_PREFIX):
+        return raw or ""
+    try:
+        parts = json.loads(raw[len(CONTENT_JSON_PREFIX):])
+    except Exception:
+        return raw
+    if isinstance(parts, str):
+        return parts
+    if not isinstance(parts, list):
+        return raw
+    texts = []
+    for p in parts:
+        if isinstance(p, str):
+            if p: texts.append(p)
+            continue
+        if not isinstance(p, dict): continue
+        t = str(p.get("type") or "").lower()
+        if t in ("text", "input_text", "output_text"):
+            v = p.get("text")
+            if isinstance(v, str) and v: texts.append(v)
+    return "\\n\\n".join(texts)
+
+def pick_reasoning(row):
+    for col in ("reasoning", "reasoning_content"):
+        v = (row[col] or "").strip() if row[col] else ""
+        if v: return v
+    details = (row["reasoning_details"] or "").strip()
+    if not details: return ""
+    try:
+        parsed = json.loads(details)
+    except Exception:
+        return ""
+    if isinstance(parsed, str): return parsed
+    if isinstance(parsed, list):
+        texts = []
+        for entry in parsed:
+            if not isinstance(entry, dict): continue
+            for k in ("text", "thinking"):
+                v = entry.get(k)
+                if isinstance(v, str) and v: texts.append(v); break
+        if texts: return "\\n\\n".join(texts)
+    return ""
+
+def parse_tool_calls(raw):
+    if not raw or not raw.strip(): return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list): return []
+    out = []
+    for entry in parsed:
+        if not isinstance(entry, dict): continue
+        fn = entry.get("function") or {}
+        name = fn.get("name")
+        if not isinstance(name, str) or not name: continue
+        call_id = entry.get("call_id") or entry.get("id") or ""
+        raw_args = fn.get("arguments")
+        args = raw_args if isinstance(raw_args, str) else ""
+        try:
+            args = json.dumps(json.loads(args), indent=2)
+        except Exception:
+            pass
+        out.append({"callId": call_id, "name": name, "args": args})
+    return out
+
 rows = conn.execute(
-    "SELECT id, role, content, timestamp FROM messages WHERE session_id=? ORDER BY id ASC",
+    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
+    "reasoning, reasoning_content, reasoning_details "
+    "FROM messages WHERE session_id = ? AND role IN ('user','assistant','tool') "
+    "ORDER BY timestamp, id",
     (session_id,)
 ).fetchall()
-print(json.dumps([{"id": r["id"], "role": r["role"], "content": r["content"] or "", "timestamp": r["timestamp"]} for r in rows]))
+
+items = []
+for r in rows:
+    text = decode(r["content"] or "")
+    if r["role"] == "user":
+        if not text: continue
+        items.append({"kind":"user","id":r["id"],"content":text,"timestamp":r["timestamp"]})
+        continue
+    if r["role"] == "assistant":
+        reasoning_text = pick_reasoning(r)
+        if reasoning_text:
+            items.append({"kind":"reasoning","id":r["id"],"assistantId":r["id"],"text":reasoning_text,"timestamp":r["timestamp"]})
+        if text:
+            items.append({"kind":"assistant","id":r["id"],"content":text,"timestamp":r["timestamp"]})
+        for tc in parse_tool_calls(r["tool_calls"]):
+            items.append({"kind":"tool_call","id":r["id"],"assistantId":r["id"],"callId":tc["callId"],"name":tc["name"],"args":tc["args"],"timestamp":r["timestamp"]})
+        continue
+    if r["role"] == "tool":
+        items.append({"kind":"tool_result","id":r["id"],"callId":r["tool_call_id"] or "","name":r["tool_name"] or "tool","content":text,"timestamp":r["timestamp"]})
+        continue
+
+print(json.dumps(items))
 conn.close()
 `;
   try {
@@ -1131,10 +1567,123 @@ conn.close()
       script,
       pythonJsonInput({ profile, sessionId }),
     );
-    return JSON.parse(out.trim() || "[]");
+    const items = JSON.parse(out.trim() || "[]") as HistoryItem[];
+    return hydrateSshPromptImageAttachments(config, items);
   } catch {
     return [];
   }
+}
+
+function sshImageName(filePath: string): string {
+  return filePath.split(/[\\/]/).filter(Boolean).pop() || "image";
+}
+
+function attachmentFromSshDataUrl(
+  dataUrl: string | null,
+  filePath: string,
+  id: string,
+): Attachment | null {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl || "");
+  if (!match) return null;
+  const mime = match[1].toLowerCase();
+  if (!isImageMime(mime)) return null;
+  const size = Buffer.byteLength(match[2], "base64");
+  if (size <= 0 || size > MAX_IMAGE_BYTES) return null;
+  return {
+    id,
+    kind: "image",
+    name: sshImageName(filePath),
+    mime,
+    size,
+    dataUrl: dataUrl || "",
+    path: filePath,
+  };
+}
+
+async function sshReadImageAsDataUrl(
+  config: SshConfig,
+  filePath: string,
+): Promise<string | null> {
+  const script = `
+import base64, json, mimetypes, os, sys
+payload = json.load(sys.stdin)
+path = payload.get("path") or ""
+max_bytes = int(payload.get("maxBytes") or 0)
+if not path:
+    print(json.dumps({"data_url": None})); sys.exit(0)
+path = os.path.expanduser(path)
+try:
+    st = os.stat(path)
+    if not os.path.isfile(path) or st.st_size <= 0 or (max_bytes and st.st_size > max_bytes):
+        print(json.dumps({"data_url": None})); sys.exit(0)
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if not mime.startswith("image/"):
+        print(json.dumps({"data_url": None})); sys.exit(0)
+    with open(path, "rb") as fh:
+        data = fh.read(max_bytes + 1 if max_bytes else -1)
+    if max_bytes and len(data) > max_bytes:
+        print(json.dumps({"data_url": None})); sys.exit(0)
+    print(json.dumps({"data_url": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))}))
+except Exception:
+    print(json.dumps({"data_url": None}))
+`;
+  try {
+    const out = await sshPython(
+      config,
+      script,
+      pythonJsonInput({ path: filePath, maxBytes: MAX_IMAGE_BYTES }),
+      30000,
+    );
+    const parsed = JSON.parse(out.trim() || "{}") as { data_url?: unknown };
+    return typeof parsed.data_url === "string" ? parsed.data_url : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hydrateSshPromptImageAttachments(
+  config: SshConfig,
+  items: HistoryItem[],
+): Promise<HistoryItem[]> {
+  const hydrated: HistoryItem[] = [];
+  const cache = new Map<string, Promise<string | null>>();
+
+  for (const item of items) {
+    if (item.kind !== "user") {
+      hydrated.push(item);
+      continue;
+    }
+
+    const fallback = extractLeadingVisionImageFallback(item.content);
+    if (!fallback.imagePath) {
+      hydrated.push(item);
+      continue;
+    }
+
+    const nextContent = stripTrailingImagePlaceholders(fallback.content);
+    if (item.attachments?.length) {
+      hydrated.push({ ...item, content: nextContent });
+      continue;
+    }
+
+    const dataUrlPromise =
+      cache.get(fallback.imagePath) ??
+      sshReadImageAsDataUrl(config, fallback.imagePath);
+    cache.set(fallback.imagePath, dataUrlPromise);
+    const attachment = attachmentFromSshDataUrl(
+      await dataUrlPromise,
+      fallback.imagePath,
+      `ssh-fallback-att-${item.id}-0`,
+    );
+
+    hydrated.push({
+      ...item,
+      content: nextContent,
+      ...(attachment ? { attachments: [attachment] } : {}),
+    });
+  }
+
+  return hydrated;
 }
 
 export async function sshSearchSessions(
@@ -1156,12 +1705,25 @@ conn = sqlite3.connect(db)
 conn.row_factory = sqlite3.Row
 try:
     rows = conn.execute(
-        "SELECT DISTINCT s.id, s.title, s.started_at, s.source, s.message_count, s.model, m.content as snippet "
-        "FROM sessions s JOIN messages m ON m.session_id = s.id "
-        "WHERE m.content LIKE ? ORDER BY s.started_at DESC LIMIT ?",
-        (f"%{query}%", limit)
+        "SELECT s.id, s.title, s.started_at, s.source, s.message_count, s.model, m.content as snippet "
+        "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+        "WHERE lower(coalesce(s.title, '')) LIKE lower(?) "
+        "OR lower(s.id) LIKE lower(?) "
+        "OR lower(coalesce(m.content, '')) LIKE lower(?) "
+        "ORDER BY s.started_at DESC, m.timestamp ASC, m.id ASC LIMIT ?",
+        (f"%{query}%", f"%{query}%", f"%{query}%", max(limit * 8, 50))
     ).fetchall()
-    print(json.dumps([{"sessionId": r["id"], "title": r["title"], "startedAt": r["started_at"], "source": r["source"] or "cli", "messageCount": r["message_count"] or 0, "model": r["model"] or "", "snippet": (r["snippet"] or "")[:200]} for r in rows]))
+    seen = set()
+    result = []
+    for r in rows:
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        snippet = r["snippet"] or r["title"] or ("Session " + r["id"][-6:])
+        result.append({"sessionId": r["id"], "title": r["title"], "startedAt": r["started_at"], "source": r["source"] or "cli", "messageCount": r["message_count"] or 0, "model": r["model"] or "", "snippet": snippet[:500]})
+        if len(result) >= limit:
+            break
+    print(json.dumps(result))
 except Exception as e:
     print("[]")
 conn.close()
@@ -1191,6 +1753,118 @@ export interface SshProfileInfo {
   hasSoul: boolean;
   skillCount: number;
   gatewayRunning: boolean;
+}
+
+export function parseHermesProfileListOutput(output: string): SshProfileInfo[] {
+  const profiles: SshProfileInfo[] = [];
+
+  for (const rawLine of output.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (/^profile\s+model\s+gateway\b/i.test(trimmed)) continue;
+    if (/^[─\-\s]+$/.test(trimmed)) continue;
+
+    const active = /^[◆*]/.test(trimmed);
+    const line = trimmed.replace(/^[◆*]\s*/, "");
+    const parts = line.split(/\s+/);
+    if (parts.length < 3) continue;
+
+    const [name, model, gateway] = parts;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) continue;
+    const gatewayState = gateway.toLowerCase();
+    if (gatewayState !== "running" && gatewayState !== "stopped") continue;
+
+    profiles.push({
+      name,
+      path: name === "default" ? "~/.hermes" : `~/.hermes/profiles/${name}`,
+      isDefault: name === "default",
+      isActive: active,
+      model: model === "—" ? "" : model,
+      provider: "auto",
+      hasEnv: false,
+      hasSoul: false,
+      skillCount: 0,
+      gatewayRunning: gatewayState === "running",
+    });
+  }
+
+  if (profiles.length > 0 && !profiles.some((p) => p.isActive)) {
+    const defaultProfile = profiles.find((p) => p.isDefault) ?? profiles[0];
+    defaultProfile.isActive = true;
+  }
+
+  return profiles;
+}
+
+// Per-user launcher hooks a managed deployment can drop in to wrap the real
+// Hermes CLI (custom HERMES_HOME, service user, unusual filesystem layout).
+// Kept in sync with the launcher probe order in buildRemoteHermesCmd.
+export const REMOTE_HERMES_LAUNCHER_CANDIDATES = [
+  "$HOME/.config/hermes-desktop/remote-hermes",
+  "$HOME/.hermes/desktop-remote-hermes",
+];
+
+const LAUNCHER_PRESENT_SENTINEL = "__HERMES_REMOTE_LAUNCHER__";
+
+export interface LauncherProfileResult {
+  // Whether an executable launcher hook actually exists on the remote. This is
+  // distinct from "the CLI returned profiles": the regular hermes binary on
+  // PATH can answer `profile list` even with no launcher configured, so count
+  // heuristics cannot tell the two apart — only this flag can.
+  present: boolean;
+  profiles: SshProfileInfo[];
+}
+
+// Detect whether a remote launcher hook exists and, if so, list its profiles in
+// a single round trip. When no launcher is configured the loop exits without
+// invoking the Hermes CLI, so ordinary installs stay cheap and fall through to
+// the richer filesystem scan in sshListProfiles.
+async function sshDetectLauncherProfiles(
+  config: SshConfig,
+): Promise<LauncherProfileResult> {
+  const list = REMOTE_HERMES_LAUNCHER_CANDIDATES.map((p) => `"${p}"`).join(" ");
+  // Echo the sentinel BEFORE exec so it is flushed even though exec replaces
+  // the shell; `exec` then streams the launcher's `profile list` to the same
+  // stdout. No launcher → no sentinel, empty output.
+  const script =
+    `for p in ${list}; do ` +
+    `[ -x "$p" ] && { echo ${LAUNCHER_PRESENT_SENTINEL}; exec "$p" profile list 2>/dev/null; }; ` +
+    `done`;
+  try {
+    const out = await sshExec(
+      config,
+      `sh -c ${shellQuote(script)}`,
+      undefined,
+      20000,
+    );
+    if (!out.includes(LAUNCHER_PRESENT_SENTINEL)) {
+      return { present: false, profiles: [] };
+    }
+    const cleaned = out
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== LAUNCHER_PRESENT_SENTINEL)
+      .join("\n");
+    return { present: true, profiles: parseHermesProfileListOutput(cleaned) };
+  } catch {
+    return { present: false, profiles: [] };
+  }
+}
+
+// Decide which profile list represents the actual remote runtime. A configured
+// launcher runs against the deployment's real HERMES_HOME and is authoritative;
+// the filesystem scan always assumes ~/.hermes. Prefer the launcher whenever it
+// is present and returned profiles — even when it reports the SAME number of
+// profiles as the scan — so Office/Agents reflect the live runtime instead of
+// stale home-directory state. Exported for unit testing the decision in
+// isolation from any live SSH host.
+export function selectSshProfiles(
+  launcher: LauncherProfileResult,
+  scannedProfiles: SshProfileInfo[],
+): SshProfileInfo[] {
+  if (launcher.present && launcher.profiles.length > 0)
+    return launcher.profiles;
+  if (scannedProfiles.length > 0) return scannedProfiles;
+  return launcher.profiles;
 }
 
 export async function sshListProfiles(
@@ -1230,7 +1904,14 @@ def gw_running(path):
     pid_file = os.path.join(path, "gateway.pid")
     if not os.path.exists(pid_file): return False
     try:
-        pid = int(open(pid_file).read().strip())
+        raw = open(pid_file).read().strip()
+        # \`hermes gateway run\` writes a JSON pidfile ({"pid": N, ...}); older
+        # builds wrote a bare integer. Handle both.
+        try:
+            d = json.loads(raw)
+            pid = int(d.get("pid") if isinstance(d, dict) else d)
+        except Exception:
+            pid = int(raw)
         os.kill(pid, 0)
         return True
     except:
@@ -1263,10 +1944,18 @@ if os.path.isdir(profiles_dir):
 
 print(json.dumps(profiles))
 `;
+  const launcher = await sshDetectLauncherProfiles(config);
+
   try {
     const out = await sshPython(config, script);
-    return JSON.parse(out.trim() || "[]");
+    const scannedProfiles = JSON.parse(out.trim() || "[]") as SshProfileInfo[];
+    return selectSshProfiles(launcher, scannedProfiles);
   } catch {
+    // The filesystem scan failed (e.g. no python on the remote). A configured
+    // launcher is still authoritative; otherwise fall back to a minimal default.
+    if (launcher.present && launcher.profiles.length > 0) {
+      return launcher.profiles;
+    }
     return [
       {
         name: "default",
@@ -1287,26 +1976,48 @@ print(json.dumps(profiles))
 export async function sshCreateProfile(
   config: SshConfig,
   name: string,
-  clone: boolean,
-): Promise<boolean> {
+  cloneFrom: string | null,
+): Promise<{ success: boolean; error?: string }> {
+  const safe = name.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!safe) return { success: false, error: "Invalid profile name" };
+  const quoted = shellQuote(safe);
   try {
-    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "");
-    if (!safe) return false;
-    const quoted = shellQuote(safe);
-    if (clone) {
+    if (cloneFrom) {
+      const safeSource = cloneFrom.replace(/[^a-zA-Z0-9_-]/g, "") || "default";
+      // No `|| mkdir` fallback here: a failed clone must surface as an error
+      // rather than silently leaving an empty profile that copied no config,
+      // keys, or skills. sshExec rejects on a non-zero exit, caught below.
+      // buildRemoteHermesCmd locates the CLI in the remote venv/launcher when
+      // `hermes` is not on the non-interactive SSH PATH; the subcommand is
+      // `profile` (singular) to match the rest of the SSH profile calls.
       await sshExec(
         config,
-        `hermes profiles create ${quoted} --clone-from default 2>&1 || mkdir -p ~/.hermes/profiles/${quoted}`,
+        buildRemoteHermesCmd([
+          "profile",
+          "create",
+          safe,
+          "--clone-from",
+          safeSource,
+        ]),
       );
     } else {
+      // A fresh profile is just a directory, so falling back to mkdir when the
+      // remote CLI lacks the subcommand is an acceptable, lossless result.
       await sshExec(
         config,
-        `hermes profiles create ${quoted} 2>&1 || mkdir -p ~/.hermes/profiles/${quoted}`,
+        `${buildRemoteHermesCmd([
+          "profile",
+          "create",
+          safe,
+        ])} 2>&1 || mkdir -p ~/.hermes/profiles/${quoted}`,
       );
     }
-    return true;
-  } catch {
-    return false;
+    return { success: true };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Failed to create profile",
+    };
   }
 }
 
@@ -1318,9 +2029,15 @@ export async function sshDeleteProfile(
     const safe = name.replace(/[^a-zA-Z0-9_-]/g, "");
     if (!safe || safe === "default") return false;
     const quoted = shellQuote(safe);
+    // `profile` (singular) subcommand, resolved via buildRemoteHermesCmd so it
+    // works when `hermes` is not on the non-interactive SSH PATH; fall back to
+    // a filesystem remove when the CLI is unavailable/lacks the subcommand.
     await sshExec(
       config,
-      `hermes profiles delete ${quoted} --yes 2>&1 || rm -rf ~/.hermes/profiles/${quoted}`,
+      `${buildRemoteHermesCmd(
+        ["profile", "delete", safe, "--yes"],
+        " 2>&1",
+      )} || rm -rf ~/.hermes/profiles/${quoted}`,
     );
     return true;
   } catch {
@@ -1329,45 +2046,360 @@ export async function sshDeleteProfile(
 }
 
 // ── Gateway ───────────────────────────────────────────────────────────────────
+//
+// In SSH mode the remote gateway may be owned by a systemd `hermes.service`
+// unit — the standard VPS installer sets this up. Starting our own detached
+// `nohup` gateway then strands that unit in a restart crash-loop (issue
+// #285). Each operation below therefore asks the remote, in a single shell
+// `if`, whether such a unit is installed and routes the request through
+// systemd when it is — one SSH round-trip, atomic decision. The command
+// strings are built by the exported helpers below so they can be unit
+// tested without a live host.
 
-export async function sshGatewayStatus(config: SshConfig): Promise<boolean> {
+/**
+ * Shell test that succeeds when a systemd `hermes.service` unit file is
+ * installed on the remote. Safe on hosts without systemd: a missing
+ * `systemctl` yields empty output, so the test simply fails and callers
+ * fall back to the plain (`nohup` / pidfile) path.
+ */
+const SYSTEMD_HERMES_UNIT_TEST =
+  "systemctl list-unit-files hermes.service 2>/dev/null | " +
+  "grep -q '^hermes\\.service'";
+
+/**
+ * Command to start the remote gateway (issue #285). When a systemd
+ * `hermes.service` exists it owns the lifecycle, so the request is handed
+ * to systemd — `hermes.service` is a system unit, so `sudo` is tried first,
+ * then a direct call for when the SSH user is root. If neither works the
+ * command does nothing on purpose: an unmanaged `nohup` orphan that
+ * crash-loops the systemd unit is worse than a gateway that simply did not
+ * start (the status check will then report it as down). The detached
+ * `nohup` start is used only when there is no unit to collide with.
+ */
+function remoteGatewayPidPath(profile?: string): string {
+  return profile && profile !== "default"
+    ? `$HOME/.hermes/profiles/${profile}/gateway.pid`
+    : "$HOME/.hermes/gateway.pid";
+}
+
+function remoteGatewayLogPath(profile?: string): string {
+  return profile && profile !== "default"
+    ? `$HOME/.hermes/profiles/${profile}/gateway.log`
+    : "$HOME/.hermes/gateway.log";
+}
+
+export function buildGatewayStartCommand(profile?: string): string {
+  // NB: `gateway run` (foreground, backgrounded here via nohup), NOT `gateway
+  // start`. `gateway start` drives the systemd/launchd *service* and fails with
+  // "Gateway service is not installed" on a bare VPS that never ran `hermes
+  // gateway install` — which is the common SSH remote. `gateway run` launches
+  // the gateway (and its api_server, when API_SERVER_ENABLED) directly and
+  // writes ~/.hermes/gateway.pid, matching the pid-based status/stop commands
+  // below. Hosts that DO have a systemd unit still go through systemctl.
+  if (profile && profile !== "default") {
+    return (
+      `mkdir -p $HOME/.hermes/profiles/${profile}; ` +
+      `(nohup ${buildRemoteHermesCmd(
+        ["--profile", profile, "gateway", "run"],
+        ` > ${remoteGatewayLogPath(profile)} 2>&1`,
+      )} &); sleep 0.3`
+    );
+  }
+  return (
+    `if ${SYSTEMD_HERMES_UNIT_TEST}; then ` +
+    `sudo -n systemctl start hermes.service 2>/dev/null || ` +
+    `systemctl start hermes.service 2>/dev/null || true; ` +
+    `else ` +
+    // buildRemoteHermesCmd (not bare `hermes`) so the run works on remotes
+    // where `hermes` is not on the non-interactive SSH PATH (only the venv /
+    // launcher locations) — matching the named-profile branch above.
+    `(nohup ${buildRemoteHermesCmd(
+      ["gateway", "run"],
+      " > $HOME/.hermes/gateway.log 2>&1",
+    )} &); sleep 0.3; ` +
+    `fi`
+  );
+}
+
+/**
+ * Command to stop the remote gateway (issue #285). Routed through systemd
+ * when a `hermes.service` unit exists, so the unit is left cleanly inactive
+ * rather than the desktop killing a process systemd would just restart;
+ * otherwise it falls back to `hermes gateway stop` and, last resort, the
+ * recorded pid.
+ */
+export function buildGatewayStopCommand(profile?: string): string {
+  if (profile && profile !== "default") {
+    const pidPath = remoteGatewayPidPath(profile);
+    return (
+      `${buildRemoteHermesCmd(["--profile", profile, "gateway", "stop"], " 2>/dev/null")} || ` +
+      `(if [ -f ${pidPath} ]; then ` +
+      `pid=$(python3 -c "import json; d=json.load(open('${pidPath}')); print(d['pid'] if isinstance(d,dict) else d)" 2>/dev/null); ` +
+      `[ -n "$pid" ] && kill $pid 2>/dev/null; fi); true`
+    );
+  }
+  return (
+    `if ${SYSTEMD_HERMES_UNIT_TEST}; then ` +
+    `sudo -n systemctl stop hermes.service 2>/dev/null || ` +
+    `systemctl stop hermes.service 2>/dev/null || true; ` +
+    `else ` +
+    // buildRemoteHermesCmd (not bare `hermes`) so stop works on remotes where
+    // `hermes` is not on the non-interactive SSH PATH — matching the named-
+    // profile branch above; the recorded-pid kill remains the last resort.
+    `${buildRemoteHermesCmd(["gateway", "stop"], " 2>/dev/null")} || ` +
+    `(if [ -f $HOME/.hermes/gateway.pid ]; then ` +
+    `pid=$(python3 -c "import json; d=json.load(open('$HOME/.hermes/gateway.pid')); print(d['pid'] if isinstance(d,dict) else d)" 2>/dev/null); ` +
+    `[ -n "$pid" ] && kill $pid 2>/dev/null; fi); true; ` +
+    `fi`
+  );
+}
+
+/**
+ * Command to report remote gateway state (issue #285). For a systemd-managed
+ * gateway this is the unit's `is-active` state (`active` when up); otherwise
+ * it is a liveness check on the recorded pid. Prints `active` or `running`
+ * when up, anything else when not.
+ *
+ * `healthPort` (issue #432): Docker-backed installs record the pid in the
+ * CONTAINER's pid namespace, so a host-side `kill -0` reports a healthy
+ * gateway as stopped — and the desktop then nohups a second `gateway run`
+ * into the container. When the recorded pid is not visible on the host, fall
+ * back to probing the gateway's loopback health endpoint, which is
+ * namespace-agnostic.
+ */
+export function buildGatewayStatusCommand(
+  profile?: string,
+  healthPort?: number,
+): string {
+  const healthProbe = Number.isInteger(healthPort)
+    ? `python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${healthPort}/health', timeout=3)" >/dev/null 2>&1 && echo "running" || echo "stopped"`
+    : `echo "stopped"`;
+  if (profile && profile !== "default") {
+    const pidPath = remoteGatewayPidPath(profile);
+    return (
+      `if [ -f ${pidPath} ]; then ` +
+      `pid=$(python3 -c "import json,sys; d=json.load(open('${pidPath}')); print(d.get('pid',d) if isinstance(d,dict) else d)" 2>/dev/null || cat ${pidPath}); ` +
+      `kill -0 $pid 2>/dev/null && echo "running" || echo "stopped"; ` +
+      `else echo "stopped"; fi`
+    );
+  }
+  return (
+    `if ${SYSTEMD_HERMES_UNIT_TEST}; then ` +
+    `systemctl is-active hermes.service 2>/dev/null || true; ` +
+    `else ` +
+    `if [ -f $HOME/.hermes/gateway.pid ]; then ` +
+    `pid=$(python3 -c "import json,sys; d=json.load(open('$HOME/.hermes/gateway.pid')); print(d.get('pid',d) if isinstance(d,dict) else d)" 2>/dev/null || cat $HOME/.hermes/gateway.pid); ` +
+    `kill -0 $pid 2>/dev/null && echo "running" || { ${healthProbe}; }; ` +
+    `else ${healthProbe}; fi; ` +
+    `fi`
+  );
+}
+
+export async function sshGatewayStatus(
+  config: SshConfig,
+  profile?: string,
+): Promise<boolean> {
   try {
+    // The health fallback targets the connection's configured gateway API
+    // port. Named profiles run their own gateways on ports this function
+    // cannot infer, so only the default-profile status uses it.
+    const healthPort =
+      !profile || profile === "default" ? config.remotePort : undefined;
     const out = await sshExec(
       config,
-      `if [ -f $HOME/.hermes/gateway.pid ]; then ` +
-        `pid=$(python3 -c "import json,sys; d=json.load(open('$HOME/.hermes/gateway.pid')); print(d.get('pid',d) if isinstance(d,dict) else d)" 2>/dev/null || cat $HOME/.hermes/gateway.pid); ` +
-        `kill -0 $pid 2>/dev/null && echo "running" || echo "stopped"; ` +
-        `else echo "stopped"; fi`,
+      buildGatewayStatusCommand(profile, healthPort),
     );
-    return out.trim() === "running";
+    const state = out.trim();
+    return state === "running" || state === "active";
   } catch {
     return false;
   }
 }
 
-export async function sshStartGateway(config: SshConfig): Promise<void> {
+// In-flight dedup so a connect storm (model-library + chat + sessions firing at
+// once, each finding "no gateway" before any start writes the pidfile) can't
+// launch several `gateway run` processes — observed as 4+ concurrent gateways
+// piling up and OOM-killing a small remote. Re-checks status inside the guard so
+// a gateway that came up between the caller's check and here isn't duplicated.
+const gatewayStartPromises = new Map<string, Promise<void>>();
+
+export async function sshStartGateway(
+  config: SshConfig,
+  profile?: string,
+): Promise<void> {
+  const key = `${config.host}:${config.port || 22}:${config.username}:${profile || "default"}`;
+  const inflight = gatewayStartPromises.get(key);
+  if (inflight) return inflight;
+
+  const run = (async (): Promise<void> => {
+    if (await sshGatewayStatus(config, profile)) return; // already up — don't duplicate
+    try {
+      await sshExec(config, buildGatewayStartCommand(profile));
+    } catch {
+      // best effort
+    }
+  })();
+  gatewayStartPromises.set(key, run);
   try {
-    await sshExec(
-      config,
-      `nohup hermes gateway start > $HOME/.hermes/gateway.log 2>&1 &`,
-    );
+    await run;
+  } finally {
+    gatewayStartPromises.delete(key);
+  }
+}
+
+export async function sshStopGateway(
+  config: SshConfig,
+  profile?: string,
+): Promise<void> {
+  try {
+    await sshExec(config, buildGatewayStopCommand(profile));
   } catch {
     // best effort
   }
 }
 
-export async function sshStopGateway(config: SshConfig): Promise<void> {
+export async function sshResolveApiServerPort(
+  config: SshConfig,
+  profile?: string,
+): Promise<number> {
+  if (!profile || profile === "default") return config.remotePort || 8642;
+  const fallbackPort = config.remotePort || 8642;
+  const script = `
+import json, os, re, sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+profile = payload.get("profile")
+fallback_port = int(payload.get("fallbackPort") or 8642)
+home = os.path.expanduser("~/.hermes")
+profiles_dir = os.path.join(home, "profiles")
+
+def config_path(name):
+    if name and name != "default":
+        return os.path.join(profiles_dir, name, "config.yaml")
+    return os.path.join(home, "config.yaml")
+
+def read(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+def line_indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+def api_server_bounds(lines):
+    for i, line in enumerate(lines):
+        if re.match(r"^\\s*api_server\\s*:\\s*(?:#.*)?$", line):
+            indent = line_indent(line)
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() and line_indent(lines[j]) <= indent:
+                    end = j
+                    break
+            return i, end, indent
+    return None
+
+def configured_port(text):
+    lines = text.splitlines()
+    bounds = api_server_bounds(lines)
+    if not bounds:
+        return None
+    start, end, _ = bounds
+    for line in lines[start + 1:end]:
+        m = re.match(r"^\\s*port\\s*:\\s*[\\"']?(\\d+)[\\"']?\\s*(?:#.*)?$", line)
+        if m:
+            port = int(m.group(1))
+            if 0 < port < 65536:
+                return port
+    return None
+
+def existing_ports():
+    ports = {fallback_port}
+    paths = [config_path(None)]
+    if os.path.isdir(profiles_dir):
+        for name in os.listdir(profiles_dir):
+            p = os.path.join(profiles_dir, name)
+            if os.path.isdir(p):
+                paths.append(os.path.join(p, "config.yaml"))
+    for path in paths:
+        port = configured_port(read(path))
+        if port:
+            ports.add(port)
+    return ports
+
+def allocate_port():
+    used = existing_ports()
+    for port in range(fallback_port + 1, min(65535, fallback_port + 100) + 1):
+        if port not in used:
+            return port
+    return fallback_port
+
+def ensure_profile_port(path, port):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = read(path)
+    lines = text.splitlines()
+    bounds = api_server_bounds(lines)
+    if bounds:
+        start, end, indent = bounds
+        for i in range(start + 1, end):
+            if re.match(r"^\\s*port\\s*:", lines[i]):
+                lines[i] = " " * line_indent(lines[i]) + f"port: {port}"
+                break
+        else:
+            extra_index = None
+            extra_indent = indent + 2
+            for i in range(start + 1, end):
+                if re.match(r"^\\s*extra\\s*:\\s*(?:#.*)?$", lines[i]):
+                    extra_index = i
+                    extra_indent = line_indent(lines[i])
+                    break
+            if extra_index is not None:
+                lines.insert(extra_index + 1, " " * (extra_indent + 2) + f"port: {port}")
+            else:
+                lines.insert(start + 1, " " * (indent + 2) + "enabled: true")
+                lines.insert(start + 2, " " * (indent + 2) + "extra:")
+                lines.insert(start + 3, " " * (indent + 4) + f"port: {port}")
+    else:
+        platforms_index = None
+        for i, line in enumerate(lines):
+            if re.match(r"^\\s*platforms\\s*:\\s*(?:#.*)?$", line):
+                platforms_index = i
+                break
+        block = ["  api_server:", "    enabled: true", "    extra:", f"      port: {port}"]
+        if platforms_index is not None:
+            lines[platforms_index + 1:platforms_index + 1] = block
+        else:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.extend(["platforms:", *block])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\\n".join(lines) + "\\n")
+
+path = config_path(profile)
+current = configured_port(read(path))
+if current:
+    print(current)
+else:
+    port = allocate_port()
+    ensure_profile_port(path, port)
+    print(port)
+`;
   try {
-    await sshExec(
+    const out = await sshPython(
       config,
-      `hermes gateway stop 2>/dev/null || ` +
-        `(if [ -f $HOME/.hermes/gateway.pid ]; then ` +
-        `pid=$(python3 -c "import json; d=json.load(open('$HOME/.hermes/gateway.pid')); print(d['pid'] if isinstance(d,dict) else d)" 2>/dev/null); ` +
-        `[ -n "$pid" ] && kill $pid 2>/dev/null; fi); true`,
+      script,
+      pythonJsonInput({ profile, fallbackPort }),
     );
-  } catch {
-    // best effort
+    const port = parseInt(out.trim(), 10);
+    if (port > 0 && port < 65536) return port;
+  } catch (err) {
+    console.warn(
+      "[ssh] Failed to allocate remote profile API port:",
+      err instanceof Error ? err.message : String(err),
+    );
   }
+  return fallbackPort;
 }
 
 // ── Remote API key (for chat auth through SSH tunnel) ─────────────────────────
@@ -1379,6 +2411,530 @@ export async function sshReadRemoteApiKey(config: SshConfig): Promise<string> {
   } catch {
     return "";
   }
+}
+
+export interface SshApiServerKeyResult {
+  key: string;
+  /** True when the key and/or enable flag were just written — the caller must
+   *  (re)start the gateway so the api_server platform picks them up. */
+  created: boolean;
+}
+
+// Provision the remote gateway api_server for SSH chat over /v1 — the no-build
+// transport (no dashboard web dist, no Node) used by remote mode and
+// hermes-webui's gateway backend. SSH mode, unlike local mode (startGateway),
+// never WROTE these to the remote, so a fresh server had no /v1 endpoint at all:
+// the api_server refuses to start without API_SERVER_KEY, and the gateway only
+// loads the api_server platform when API_SERVER_ENABLED is truthy
+// (gateway/config.py). Ensures both, generating a key when missing/invalid.
+// In-flight dedup — same race class as the dashboard token: this is ensured on
+// every chat, so concurrent first-connect callers could each see "no key" and
+// append a different generated API_SERVER_KEY, leaving the gateway (dotenv
+// last-wins) on one value while a caller cached another → 401 over /v1.
+const apiServerKeyPromises = new Map<string, Promise<SshApiServerKeyResult>>();
+
+export async function sshEnsureApiServerKey(
+  config: SshConfig,
+  profile?: string,
+): Promise<SshApiServerKeyResult> {
+  const cacheKey = `${config.host}:${config.port || 22}:${config.username}:${profile || "default"}`;
+  const inflight = apiServerKeyPromises.get(cacheKey);
+  if (inflight) return inflight;
+
+  const run = (async (): Promise<SshApiServerKeyResult> => {
+    const result = await sshUpdateEnv(
+      config,
+      { operation: "ensure-api" },
+      profile,
+    );
+    return { key: result.values.API_SERVER_KEY, created: result.changed };
+  })();
+
+  apiServerKeyPromises.set(cacheKey, run);
+  try {
+    return await run;
+  } finally {
+    apiServerKeyPromises.delete(cacheKey);
+  }
+}
+
+// Poll the remote api_server's /health on the given loopback port until it
+// answers or the deadline passes. Runs on the remote via python3 (no curl
+// dependency). Lets a freshly (re)started gateway finish binding before we open
+// the tunnel, so the first chat doesn't race "tunnel health check failed".
+export async function sshWaitGatewayApiReady(
+  config: SshConfig,
+  port: number,
+  timeoutMs = 20000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const script =
+    `import urllib.request as u\n` +
+    `try:\n` +
+    ` print(u.urlopen("http://127.0.0.1:${port}/health", timeout=3).status)\n` +
+    `except Exception:\n` +
+    ` print(0)`;
+  while (Date.now() <= deadline) {
+    try {
+      const out = await sshExec(
+        config,
+        `python3 -c ${shellQuote(script)}`,
+        undefined,
+        8000,
+      );
+      if (out.trim() === "200") return true;
+    } catch {
+      // transient — keep polling until the deadline
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+
+// ── Dashboard lifecycle ─────────────────────────────────────────────────────
+//
+// Dashboard transport over SSH. The desktop starts `hermes dashboard` on the
+// remote and tunnels to it for the model library, session list, and the chat
+// WebSocket (/api/ws) — the surfaces the gateway api_server does NOT serve.
+//
+// IMPORTANT: the dashboard is NOT a /v1 superset. hermes_cli/web_server.py has
+// no /v1/chat|responses|runs routes and does not proxy /v1 to the gateway, so
+// chat over the dashboard tunnel uses /api/ws (token auth), never /v1. The /v1
+// chat transport lives ONLY on the gateway api_server (port 8642, API_SERVER_KEY
+// auth); see sshEnsureApiServerKey + prepareSshTunnel's gateway branch. The
+// dashboard also requires a built web dist (Node), which gateway-only installs
+// lack — those fall back to the gateway /v1 path. Its /api/* routes are gated by
+// HERMES_DASHBOARD_SESSION_TOKEN (the api_server key is rejected there).
+
+const REMOTE_DASHBOARD_DEFAULT_PORT = 9119;
+const REMOTE_DASHBOARD_PORT_ENV = "HERMES_DESKTOP_DASHBOARD_PORT";
+
+function remoteDashboardLogPath(profile?: string): string {
+  return profile && profile !== "default"
+    ? `$HOME/.hermes/profiles/${profile}/dashboard.log`
+    : "$HOME/.hermes/dashboard.log";
+}
+
+// Read the dashboard session token from the remote .env (per profile),
+// generating + persisting one when absent so it stays stable across reconnects
+// and is shared by the remote dashboard process and the desktop client.
+// In-flight dedup so a connect storm (the dashboard is ensured on every chat /
+// model-library / session op) can't run several token provisions at once. The
+// previous raw `printf >> .env` had no guard, so concurrent callers each read
+// "no token" and appended a different one — observed as 9 divergent
+// HERMES_DASHBOARD_SESSION_TOKEN lines in one remote .env, where dotenv's
+// last-wins value drifted from whatever a caller cached.
+const dashboardTokenPromises = new Map<string, Promise<string>>();
+
+export async function sshEnsureDashboardToken(
+  config: SshConfig,
+  profile?: string,
+): Promise<string> {
+  const envPath = remoteEnvPath(profile);
+  const cacheKey = `${config.host}:${config.port || 22}:${config.username}:${envPath}`;
+  const inflight = dashboardTokenPromises.get(cacheKey);
+  if (inflight) return inflight;
+
+  const run = (async (): Promise<string> => {
+    const result = await sshUpdateEnv(
+      config,
+      { operation: "ensure-dashboard" },
+      profile,
+    );
+    return result.values.HERMES_DASHBOARD_SESSION_TOKEN;
+  })();
+
+  dashboardTokenPromises.set(cacheKey, run);
+  try {
+    return await run;
+  } finally {
+    dashboardTokenPromises.delete(cacheKey);
+  }
+}
+
+// Resolve the remote dashboard port. Default profile uses 9119; named profiles
+// get a distinct stable port derived from their api_server port so they never
+// collide with the default or each other.
+export async function sshResolveDashboardPort(
+  config: SshConfig,
+  profile?: string,
+): Promise<number> {
+  try {
+    const env = await sshReadEnv(config, profile);
+    const persisted = Number.parseInt(env[REMOTE_DASHBOARD_PORT_ENV] || "", 10);
+    if (persisted > 0 && persisted < 65536) return persisted;
+  } catch {
+    // Fall through to the stable preferred port.
+  }
+  if (!profile || profile === "default") return REMOTE_DASHBOARD_DEFAULT_PORT;
+  const apiPort = await sshResolveApiServerPort(config, profile);
+  return REMOTE_DASHBOARD_DEFAULT_PORT + (apiPort - 8642);
+}
+
+async function sshAllocateDashboardPort(config: SshConfig): Promise<number> {
+  const script = `
+import socket
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+`;
+  const out = await sshPython(config, script);
+  const port = Number.parseInt(out.trim(), 10);
+  if (!(port > 0 && port < 65536)) {
+    throw new Error("Remote host did not return a valid dashboard port.");
+  }
+  return port;
+}
+
+async function sshPersistDashboardPort(
+  config: SshConfig,
+  profile: string | undefined,
+  port: number,
+): Promise<void> {
+  await sshSetEnvValue(
+    config,
+    REMOTE_DASHBOARD_PORT_ENV,
+    String(port),
+    profile,
+  );
+}
+
+// Remote-side readiness probe: is the dashboard answering /api/status on the
+// given loopback port? (/api/status is unauthenticated.) Runs on the remote via
+// python3 so it needs no curl on the host.
+export async function sshDashboardRunning(
+  config: SshConfig,
+  port: number,
+): Promise<boolean> {
+  try {
+    const script =
+      `import urllib.request as u\n` +
+      `try:\n` +
+      ` print(u.urlopen("http://127.0.0.1:${port}/api/status", timeout=3).status)\n` +
+      `except Exception:\n` +
+      ` print(0)`;
+    const out = await sshExec(
+      config,
+      `python3 -c ${shellQuote(script)}`,
+      undefined,
+      8000,
+    );
+    return out.trim() === "200";
+  } catch {
+    return false;
+  }
+}
+
+// A public /api/status response only proves that *something* HTTP-speaking is
+// bound to the dashboard port. Verify an authenticated dashboard route before
+// handing the target to callers; otherwise a stale dashboard (different token)
+// or another service on 9119 is mistaken for a usable dashboard, leading to
+// /api/* 401s and legacy /v1 chat being POSTed to the wrong server (405).
+export async function sshDashboardAuthenticated(
+  config: SshConfig,
+  port: number,
+  token: string,
+): Promise<boolean> {
+  const script = `
+import json
+import sys
+import urllib.request
+
+payload = json.loads(sys.stdin.read() or "{}")
+port = int(payload.get("port") or 0)
+token = str(payload.get("token") or "")
+request = urllib.request.Request(
+    f"http://127.0.0.1:{port}/api/sessions?limit=1",
+    headers={"X-Hermes-Session-Token": token},
+)
+try:
+    with urllib.request.urlopen(request, timeout=3) as response:
+        print(response.status)
+except Exception:
+    print(0)
+`;
+  try {
+    const out = await sshPython(
+      config,
+      script,
+      pythonJsonInput({ port, token }),
+      8000,
+    );
+    return out.trim() === "200";
+  } catch {
+    return false;
+  }
+}
+
+// Start `hermes dashboard` on the remote, bound to loopback (the SSH tunnel
+// terminates there) with --skip-build (the web dist is prebuilt) and the
+// session token in its env. Backgrounded so the exec returns.
+export async function sshStartDashboard(
+  config: SshConfig,
+  profile: string | undefined,
+  port: number,
+  token: string,
+): Promise<void> {
+  // Always the unified machine dashboard (no --profile / --isolated): one server
+  // serves every profile's data via `?profile=`, so the single global SSH tunnel
+  // has exactly one target. Per-profile isolated dashboards on distinct ports
+  // thrash that tunnel when the app queries multiple profiles at once. `profile`
+  // is accepted for signature compatibility but intentionally unused.
+  void profile;
+  const cmd = buildRemoteHermesCmd([
+    "dashboard",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--no-open",
+    "--skip-build",
+  ]);
+  const log = remoteDashboardLogPath(profile);
+  await sshExec(
+    config,
+    `(nohup env HERMES_DASHBOARD_SESSION_TOKEN=${shellQuote(
+      token,
+    )} ${cmd} > ${log} 2>&1 &); sleep 0.2`,
+  );
+}
+
+// Poll the remote readiness probe until the dashboard answers or the deadline
+// passes.
+export async function sshWaitDashboardReady(
+  config: SshConfig,
+  port: number,
+  timeoutMs = 30000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (await sshDashboardRunning(config, port)) return true;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+
+export interface SshDashboardTarget {
+  port: number;
+  token: string;
+}
+
+const dashboardDistBuildPromises = new Map<string, Promise<boolean>>();
+
+// Candidate hermes-agent install roots, most specific first. A system-wide
+// install (the Linux package / install.sh default) lives at
+// /usr/local/lib/hermes-agent — NOT under $HOME — so a hardcoded
+// ~/.hermes/hermes-agent path wrongly concludes the dashboard web dist is
+// absent and forces every SSH connection into basic chat. Mirrors the resolver
+// philosophy of buildRemoteHermesCmd.
+const REMOTE_HERMES_ROOT_CANDIDATES = [
+  "/usr/local/lib/hermes-agent",
+  "$HOME/.hermes/hermes-agent",
+  "/opt/hermes/hermes-agent",
+  "$HOME/hermes-agent",
+];
+
+// Resolve the remote hermes-agent install root that has (or can build) the
+// dashboard web dist. Returns the first candidate whose built dist exists, else
+// the first that has the `web/` workspace (buildable), else null. One round
+// trip.
+export async function sshResolveDashboardRoot(
+  config: SshConfig,
+): Promise<string | null> {
+  const roots = REMOTE_HERMES_ROOT_CANDIDATES.join(" ");
+  // Prefer a root with the prebuilt dist; fall back to one with web sources.
+  const script =
+    `built=""; buildable=""; ` +
+    `for r in ${roots}; do ` +
+    `  if [ -z "$built" ] && [ -f "$r/hermes_cli/web_dist/index.html" ]; then built="$r"; fi; ` +
+    `  if [ -z "$buildable" ] && [ -f "$r/web/package.json" ]; then buildable="$r"; fi; ` +
+    `done; ` +
+    `if [ -n "$built" ]; then echo "$built"; elif [ -n "$buildable" ]; then echo "$buildable"; fi`;
+  try {
+    const out = (await sshExec(config, script, undefined, 10000)).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+// Ensure the dashboard web dist is built on the remote so `hermes dashboard
+// --skip-build` can serve it. Resolves the real install root first (system-wide
+// or under $HOME), so an already-built dist is detected wherever hermes lives.
+// The install vendors Node (~/.hermes/node) and the web workspace deps, so a
+// missing dist just needs the vite build (→ hermes_cli/web_dist). Returns true
+// when the dist exists (already or after building), false when it can't (no
+// install with web sources / no Node / build failed) — sshEnsureDashboard then
+// reports the dashboard unavailable and the desktop falls back to legacy.
+// Concurrent callers share one in-flight build so a connect storm can't kick
+// off several `npm run build` at once.
+export async function sshEnsureDashboardDist(
+  config: SshConfig,
+): Promise<boolean> {
+  const root = await sshResolveDashboardRoot(config);
+  if (!root) return false;
+  const marker = `${root}/hermes_cli/web_dist/index.html`;
+  const exists = async (): Promise<boolean> => {
+    try {
+      const out = await sshExec(
+        config,
+        `[ -f "${marker}" ] && echo yes || echo no`,
+        undefined,
+        10000,
+      );
+      return out.trim() === "yes";
+    } catch {
+      return false;
+    }
+  };
+  if (await exists()) return true;
+  // Keyed by host (like the other in-flight maps): a stale in-flight build for
+  // a PREVIOUS remote must not be handed to a caller targeting a new one.
+  const buildKey = `${config.host}:${config.port || 22}:${config.username}`;
+  const inflight = dashboardDistBuildPromises.get(buildKey);
+  if (inflight) return inflight;
+  const run = (async () => {
+    try {
+      // tsc -b && vite build. Prefer the vendored Node, fall back to system
+      // Node/npm on PATH. Generous timeout: a first build on a small VPS can
+      // take a few minutes.
+      await sshExec(
+        config,
+        `cd "${root}" && ` +
+          `PATH="$HOME/.hermes/node/bin:$PATH" npm run build -w web 2>&1`,
+        undefined,
+        300000,
+      );
+    } catch {
+      // build failed (no Node, missing deps, …) — fall through to re-check
+    }
+    return exists();
+  })();
+  dashboardDistBuildPromises.set(buildKey, run);
+  try {
+    return await run;
+  } finally {
+    dashboardDistBuildPromises.delete(buildKey);
+  }
+}
+
+// Negative cache: the dashboard is "ensured" on every chat / model-library /
+// session op. Only cache a *permanent* failure — the remote has no web dist and
+// can't build one (a gateway-only install) — so we don't re-run the heavy build
+// probe every call. A TRANSIENT failure (the dashboard is still starting, a
+// readiness/auth blip) must NOT be cached: caching it would force chat's
+// `prepareSshTunnel` onto the gateway /v1 tunnel (8642) while model-library still
+// targets the dashboard port, and the single global SSH tunnel would thrash
+// between them ("SSH tunnel is not active" / 405). In-flight dedup collapses a
+// connect storm into one probe regardless.
+const DASHBOARD_UNAVAILABLE_TTL_MS = 60_000;
+const dashboardUnavailableUntil = new Map<string, number>();
+const dashboardEnsurePromises = new Map<
+  string,
+  Promise<SshDashboardTarget | null>
+>();
+
+function dashboardCacheKey(config: SshConfig, _profile?: string): string {
+  // Machine-scoped (NOT per-profile): the unified dashboard is one server for
+  // all profiles, so all profiles share one cache/in-flight entry and one tunnel
+  // target. Keying per-profile would let concurrent profiles each ensure/tunnel
+  // separately and thrash the single global tunnel.
+  return `${config.host}:${config.port || 22}:${config.username}`;
+}
+
+// Clear the dashboard negative cache — call when the connection config changes
+// so a freshly (re)configured remote is probed immediately, not after the TTL.
+export function resetSshDashboardAvailability(): void {
+  dashboardUnavailableUntil.clear();
+}
+
+// Ensure the remote has a running dashboard for SSH transport. Starts the
+// gateway too (messaging/cron stays up, and chat keeps a working /v1 endpoint),
+// builds the web dist if missing, then starts the dashboard and waits for
+// readiness. Returns the port + token to tunnel to, or null when the remote
+// can't run the dashboard (no web dist, or it won't become ready) — callers then
+// fall back to the gateway-only /v1 path (see prepareSshTunnel).
+export async function sshEnsureDashboard(
+  config: SshConfig,
+  profile?: string,
+): Promise<SshDashboardTarget | null> {
+  const cacheKey = dashboardCacheKey(config, profile);
+  const until = dashboardUnavailableUntil.get(cacheKey);
+  if (until && until > Date.now()) return null; // remote can't run a dashboard — skip the probe
+  const inflight = dashboardEnsurePromises.get(cacheKey);
+  if (inflight) return inflight;
+
+  const run = (async (): Promise<SshDashboardTarget | null> => {
+    const target = await ensureDashboardInner(config, profile);
+    if (target) {
+      dashboardUnavailableUntil.delete(cacheKey);
+      return target;
+    }
+    // Only latch the negative cache for the PERMANENT case (no buildable web
+    // dist). Transient failures stay uncached so the next op retries and the
+    // tunnel target stays consistent (dashboard, not gateway) — avoiding thrash.
+    const distOk = await sshEnsureDashboardDist(config).catch(() => false);
+    if (!distOk) {
+      dashboardUnavailableUntil.set(
+        cacheKey,
+        Date.now() + DASHBOARD_UNAVAILABLE_TTL_MS,
+      );
+    }
+    return null;
+  })();
+  dashboardEnsurePromises.set(cacheKey, run);
+  try {
+    return await run;
+  } finally {
+    dashboardEnsurePromises.delete(cacheKey);
+  }
+}
+
+async function ensureDashboardInner(
+  config: SshConfig,
+  profile?: string,
+): Promise<SshDashboardTarget | null> {
+  // The dashboard is the UNIFIED machine dashboard (default profile, one port +
+  // one token) for EVERY profile — NOT a per-profile isolated server. `hermes
+  // dashboard` serves any profile's data via `?profile=`, and the desktop has a
+  // single global SSH tunnel that can only point at one remote port. Per-profile
+  // dashboard ports (the old `--isolated` approach) made concurrent profile
+  // queries (e.g. `default` + `accessibility-auditor`) resolve different ports
+  // and thrash that one tunnel ("SSH tunnel is not active"). So all dashboard
+  // resolution here uses the machine scope (profile=undefined); callers pass the
+  // requested profile to the dashboard OPS as `?profile=` for per-profile data.
+  void profile; // intentionally machine-scoped
+  if (!(await sshGatewayStatus(config))) {
+    await sshStartGateway(config);
+  }
+  const token = await sshEnsureDashboardToken(config);
+  let port = await sshResolveDashboardPort(config);
+  if (await sshDashboardRunning(config, port)) {
+    if (await sshDashboardAuthenticated(config, port, token)) {
+      return { port, token };
+    }
+    // The preferred/persisted port belongs to a stale dashboard with another
+    // token (or a different HTTP service). Do not kill an externally managed
+    // process. Move this desktop-managed dashboard to a free remote port and
+    // persist it so every later IPC call and app restart reuses the same target.
+    port = await sshAllocateDashboardPort(config);
+    await sshPersistDashboardPort(config, undefined, port);
+  }
+  // Build the web dist if it isn't there yet (first connect to a fresh install
+  // that ran the installer but never built the dashboard UI). Without a dist,
+  // `dashboard --skip-build` can't serve, so treat an unbuildable remote as
+  // dashboard-unavailable → legacy fallback.
+  if (!(await sshEnsureDashboardDist(config))) return null;
+  await sshStartDashboard(config, undefined, port, token);
+  if (
+    (await sshWaitDashboardReady(config, port)) &&
+    (await sshDashboardAuthenticated(config, port, token))
+  ) {
+    return { port, token };
+  }
+  return null;
 }
 
 // ── Versions ──────────────────────────────────────────────────────────────────
@@ -1447,6 +3003,156 @@ export async function sshRunKanban<T = unknown>(
   }
 }
 
+export interface SshCronResult {
+  success: boolean;
+  error?: string;
+  stdout?: string;
+}
+
+export async function sshRunCron(
+  config: SshConfig,
+  args: string[],
+  opts: { profile?: string; timeoutMs?: number } = {},
+): Promise<SshCronResult> {
+  const cliArgs: string[] = [];
+  if (opts.profile && opts.profile !== "default") {
+    cliArgs.push("-p", opts.profile);
+  }
+  cliArgs.push("cron", ...args);
+  try {
+    const stdout = await sshExec(
+      config,
+      buildRemoteHermesCmd(cliArgs),
+      undefined,
+      opts.timeoutMs ?? 15000,
+    );
+    return { success: true, stdout };
+  } catch (err) {
+    return {
+      success: false,
+      error: (err as Error).message || "Remote cron command failed",
+    };
+  }
+}
+
+// ── Claw3D HQ board (read-only) ───────────────────────────────────────────────
+//
+// Claw3D ("hermes-office") maintains its own headquarters task board independent
+// of `hermes kanban`. It stores tasks at
+// `<state-dir>/claw3d/task-manager/tasks.json`, where <state-dir> resolves to
+// `~/.openclaw` (new) or `~/.clawdbot` / `~/.moltbot` (legacy) — see
+// hermes-office/src/lib/clawdbot/paths.ts. We surface it as a virtual,
+// read-only second board in the desktop's Kanban tab so the Claw3D HQ cards
+// are visible alongside the agent dispatcher's own board.
+
+interface Claw3dSharedTaskRecord {
+  id: string;
+  title: string;
+  description?: string;
+  status?: string;
+  source?: string;
+  assignedAgentId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  channel?: string | null;
+  notes?: unknown;
+  isArchived?: boolean;
+}
+
+// Claw3D's TaskBoardStatus → desktop kanban column. Claw3D has no "triage" or
+// "ready" semantics, so `review` (awaiting attention) lands in "ready" and
+// `in_progress` maps to "running". Everything else is straight-through.
+const CLAW3D_STATUS_MAP: Record<string, KanbanTask["status"]> = {
+  todo: "todo",
+  in_progress: "running",
+  blocked: "blocked",
+  review: "ready",
+  done: "done",
+};
+
+function parseIsoToEpochSeconds(value: string | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+function mapClaw3dTaskToKanbanTask(raw: Claw3dSharedTaskRecord): KanbanTask {
+  const status = (raw.status && CLAW3D_STATUS_MAP[raw.status]) || "todo";
+  const createdAt = parseIsoToEpochSeconds(raw.createdAt);
+  return {
+    id: raw.id,
+    title: raw.title,
+    body: raw.description?.trim() || null,
+    assignee: raw.assignedAgentId?.trim() || null,
+    status,
+    priority: 0,
+    tenant: null,
+    workspace_kind: "scratch",
+    workspace_path: null,
+    created_by: raw.source || null,
+    created_at: createdAt,
+    started_at: null,
+    completed_at:
+      status === "done" ? parseIsoToEpochSeconds(raw.updatedAt) : null,
+    result: null,
+    skills: [],
+    max_retries: null,
+  };
+}
+
+// Candidate state dirs mirror hermes-office's resolveStateDir() precedence:
+// new `.openclaw` first, then legacy `.clawdbot` / `.moltbot`.
+const CLAW3D_TASKS_PATHS = [
+  "~/.openclaw/claw3d/task-manager/tasks.json",
+  "~/.clawdbot/claw3d/task-manager/tasks.json",
+  "~/.moltbot/claw3d/task-manager/tasks.json",
+];
+
+export interface SshClaw3dHqResult {
+  success: boolean;
+  tasks?: KanbanTask[];
+  error?: string;
+  source?: string; // resolved remote path
+}
+
+export async function sshListClaw3dHqTasks(
+  config: SshConfig,
+): Promise<SshClaw3dHqResult> {
+  for (const remotePath of CLAW3D_TASKS_PATHS) {
+    let raw = "";
+    try {
+      raw = await sshReadFile(config, remotePath);
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+    if (!raw.trim()) continue;
+    try {
+      const parsed = JSON.parse(raw) as { tasks?: unknown };
+      const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+      const mapped = tasks
+        .filter(
+          (t): t is Claw3dSharedTaskRecord =>
+            Boolean(t) &&
+            typeof t === "object" &&
+            typeof (t as Claw3dSharedTaskRecord).id === "string" &&
+            typeof (t as Claw3dSharedTaskRecord).title === "string",
+        )
+        .filter((t) => !t.isArchived)
+        .map(mapClaw3dTaskToKanbanTask);
+      return { success: true, tasks: mapped, source: remotePath };
+    } catch (err) {
+      return {
+        success: false,
+        error: `Failed to parse Claw3D tasks.json: ${(err as Error).message}`,
+      };
+    }
+  }
+  // No file found at any candidate path — that's fine, just means the user
+  // hasn't run Claw3D's HQ board yet. Return empty rather than erroring so
+  // the renderer can still show an empty HQ board placeholder.
+  return { success: true, tasks: [] };
+}
+
 // ── Logs ──────────────────────────────────────────────────────────────────────
 
 export async function sshReadLogs(
@@ -1464,7 +3170,7 @@ export async function sshReadLogs(
     );
     const content = await sshExec(
       config,
-      `bash -c 'case "$2" in "~/"*) p="$HOME/\${2#~/}" ;; "\\$HOME/"*) p="$HOME/\${2#\\$HOME/}" ;; *) p="$2" ;; esac; tail -n "$1" -- "$p" 2>/dev/null || echo ""' -- ${shellQuote(String(safeLines))} ${shellQuote(remotePath)}`,
+      `sh -c 'case "$2" in "~/"*) p="$HOME/\${2#~/}" ;; "\\$HOME/"*) p="$HOME/\${2#\\$HOME/}" ;; *) p="$2" ;; esac; tail -n "$1" -- "$p" 2>/dev/null || echo ""' -- ${shellQuote(String(safeLines))} ${shellQuote(remotePath)}`,
     );
     return { content: content.trim(), path: `~/.hermes/logs/${file}` };
   } catch {
@@ -1488,14 +3194,21 @@ const SSH_SUPPORTED_PLATFORMS = [
   "dingtalk",
   "feishu",
   "wecom",
+  "wecom_callback",
   "weixin",
+  "qqbot",
+  "yuanbao",
+  "api_server",
+  "webhook",
   "webhooks",
+  "homeassistant",
   "home_assistant",
 ];
 
 // Map from app platform keys to gateway_state.json keys (where they differ)
 const PLATFORM_STATE_KEY: Record<string, string> = {
   home_assistant: "homeassistant",
+  webhooks: "webhook",
 };
 
 export async function sshGetPlatformEnabled(
@@ -1573,9 +3286,9 @@ export async function sshListCachedSessions(
   config: SshConfig,
   limit = 50,
   offset = 0,
+  profile?: string,
 ): Promise<CachedSession[]> {
-  void offset;
-  const sessions = await sshListSessions(config, limit, 0);
+  const sessions = await sshListSessions(config, limit, offset, profile);
   return sessions.map((s) => ({
     id: s.id,
     title: s.title || s.id,
@@ -1583,6 +3296,7 @@ export async function sshListCachedSessions(
     source: s.source,
     messageCount: s.messageCount,
     model: s.model,
+    contextFolder: null,
   }));
 }
 
@@ -1600,17 +3314,45 @@ export async function sshListCachedSessions(
 // Probe the well-known venv install paths first; fall back to bare `hermes`
 // on PATH only if none of those exist, preserving the old behavior for
 // non-installer deployments.
-function buildRemoteHermesCmd(args: string[], extraShell = ""): string {
-  const candidates = [
-    "$HOME/hermes-agent/.venv/bin/hermes",
-    "$HOME/.hermes/hermes-agent/.venv/bin/hermes",
-    "/opt/hermes/hermes-agent/.venv/bin/hermes",
-  ];
+//
+// Each install base is probed with both `.venv` and `venv` — the venv
+// directory name is not fixed, and an install that uses the un-dotted
+// `venv` was otherwise invisible even when fully working (issue #284).
+// `~/.local/bin/hermes` is also probed, where `pip install --user` flows
+// place a wrapper. Before those default install paths, probe explicit
+// per-user launcher hooks. They let managed deployments provide their own
+// executable wrapper for unusual filesystem layouts, service users, or
+// HERMES_HOME requirements without baking deployment-specific paths into the
+// desktop.
+// `command -v hermes` alone is not enough: the desktop's non-interactive SSH
+// does not source `~/.profile`/`~/.bashrc`, so any PATH additions made there
+// are not visible.
+//
+// Exported for unit testing the probe list without a live remote host.
+// Shared with the SSH target inspection in ssh-docker.ts so "is Hermes
+// installed on the host?" uses the exact same probe list as command execution.
+export const REMOTE_HERMES_CLI_CANDIDATES = [
+  "$HOME/hermes-agent/.venv/bin/hermes",
+  "$HOME/hermes-agent/venv/bin/hermes",
+  "$HOME/.hermes/hermes-agent/.venv/bin/hermes",
+  "$HOME/.hermes/hermes-agent/venv/bin/hermes",
+  "/opt/hermes/hermes-agent/.venv/bin/hermes",
+  "/opt/hermes/hermes-agent/venv/bin/hermes",
+  "$HOME/.local/bin/hermes",
+];
+
+export function buildRemoteHermesCmd(args: string[], extraShell = ""): string {
+  const launcherCandidates = REMOTE_HERMES_LAUNCHER_CANDIDATES;
+  const candidates = REMOTE_HERMES_CLI_CANDIDATES;
   const quotedArgs = args.map((a) => shellQuote(a)).join(" ");
+  const launcherProbe = launcherCandidates
+    .map((p) => `[ -x ${p} ] && exec ${p} ${quotedArgs}${extraShell}`)
+    .join("; ");
   const probe = candidates
     .map((p) => `[ -x ${p} ] && exec ${p} ${quotedArgs}${extraShell}`)
     .join("; ");
-  return `bash -c '${probe}; command -v hermes >/dev/null && exec hermes ${quotedArgs}${extraShell}; echo "ERR: hermes CLI not found on remote PATH or in any known venv location" >&2; exit 1'`;
+  const script = `${launcherProbe}; ${probe}; command -v hermes >/dev/null && exec hermes ${quotedArgs}${extraShell}; echo "ERR: hermes CLI not found on remote PATH, configured launcher, or in any known venv location" >&2; exit 1`;
+  return `sh -c ${shellQuote(script)}`;
 }
 
 export async function sshRunDoctor(config: SshConfig): Promise<string> {
@@ -1657,47 +3399,13 @@ export async function sshDiscoverMemoryProviders(
 ): Promise<MemoryProviderInfo[]> {
   const activeProvider =
     (await sshGetConfigValue(config, "memory.provider", profile)) || "";
-  const script = `
-import json, os
-known = {
-    "honcho": {"description": "memory.providers.honcho", "envVars": ["HONCHO_API_KEY"]},
-    "hindsight": {"description": "memory.providers.hindsight", "envVars": ["HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID"]},
-    "mem0": {"description": "memory.providers.mem0", "envVars": ["MEM0_API_KEY"]},
-    "retaindb": {"description": "memory.providers.retaindb", "envVars": ["RETAINDB_API_KEY"]},
-    "supermemory": {"description": "memory.providers.supermemory", "envVars": ["SUPERMEMORY_API_KEY"]},
-    "holographic": {"description": "memory.providers.holographic", "envVars": []},
-    "openviking": {"description": "memory.providers.openviking", "envVars": ["OPENVIKING_ENDPOINT", "OPENVIKING_API_KEY"]},
-    "byterover": {"description": "memory.providers.byterover", "envVars": ["BRV_API_KEY"]},
-}
-roots = [
-    os.path.expanduser("~/.hermes/plugins/memory"),
-    os.path.expanduser("~/hermes/plugins/memory"),
-    os.path.expanduser("~/hermes-agent/plugins/memory"),
-]
-names = set(known)
-for root in roots:
-    if os.path.isdir(root):
-        for name in os.listdir(root):
-            if not name.startswith("_") and os.path.isdir(os.path.join(root, name)):
-                names.add(name)
-result = []
-for name in sorted(names):
-    meta = known.get(name, {"description": f"memory.providers.{name}", "envVars": []})
-    result.append({
-        "name": name,
-        "description": meta["description"],
-        "envVars": meta["envVars"],
-        "installed": True,
-        "active": name == ${JSON.stringify(activeProvider)},
-    })
-print(json.dumps(result))
-`;
-  try {
-    const out = await sshPython(config, script);
-    return JSON.parse(out.trim() || "[]");
-  } catch {
-    return [];
-  }
+  const script = memoryProviderDiscoveryScript();
+  const out = await sshPython(
+    config,
+    script,
+    pythonJsonInput({ profile, active: activeProvider }),
+  );
+  return JSON.parse(out.trim() || "[]");
 }
 
 // ── Models library ─────────────────────────────────────────────────────────────
@@ -1747,7 +3455,11 @@ export async function sshAddModel(
 ): Promise<SavedModel> {
   const models = await sshListModels(config);
   const existing = models.find(
-    (m) => m.model === model && m.provider === provider,
+    (m) =>
+      m.model === model &&
+      m.provider === provider &&
+      normalizeModelEndpointUrl(m.baseUrl) ===
+        normalizeModelEndpointUrl(baseUrl),
   );
   if (existing) return existing;
   const entry: SavedModel = {

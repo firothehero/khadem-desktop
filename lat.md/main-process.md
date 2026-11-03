@@ -1,0 +1,338 @@
+# Main Process
+
+The Electron main process keeps the entrypoint small and separates app lifecycle from IPC registration.
+
+## Entrypoint
+
+`src/main/index.ts` performs only pre-ready setup and delegates startup.
+
+[[src/main/index.ts]] applies GPU crash preferences, enables the optional CDP testing port, and calls [[src/main/app/start.ts#startMainProcess]]. This keeps one-off process boot concerns separate from windows, menus, updater wiring, and IPC.
+
+## GPU Fallback
+
+Hardware acceleration is disabled and persisted after a GPU-process crash so machines without a usable GPU avoid an infinite crash → relaunch loop — but only temporarily, so a transient crash can't strand a working GPU on SwiftShader.
+
+[[src/main/gpu-fallback.ts#applyGpuPreferences]] disables hardware acceleration when a crash flag, relaunch sentinel, or `HERMES_DISABLE_GPU` says so, while keeping SwiftShader WebGL available. Persistent GPU-off fallback is honored by default on Windows/Linux, but macOS clears stale flags unless `HERMES_GPU_FALLBACK=1` forces it, protecting the Office tab from permanent software-rendering lag. [[src/main/gpu-fallback.ts#installGpuCrashGuard]] watches fatal GPU-process exits and relaunches with software rendering where the persistent fallback is enabled.
+
+### Flag expiry
+
+The persisted `disable-gpu.flag` is only honored for 24 hours after the crash that wrote it; a stale or unparseable flag is cleared at launch and hardware acceleration is retried.
+
+GPU crashes are often transient (driver update mid-session, a since-removed virtual display adapter, a Chromium blocklist gap for a brand-new GPU), and before the TTL a single crash silently pinned Windows/Linux machines to software rendering forever — a user with an RTX 5060 Ti ran the Office 3D tab at 1 fps on 10+ CPU cores for over a week. If the GPU genuinely still crashes, the re-armed crash guard re-persists a fresh flag, so a broken machine pays at most one crash+relaunch per 24-hour window.
+
+### User preference
+
+Settings → Appearance offers a tri-state hardware-acceleration preference — Auto (crash-guard driven, the default), Always on, Always off — persisted in `gpu-preference.json` beside the crash flag.
+
+The preference lives in `userData`, not renderer settings storage, because [[src/main/gpu-fallback.ts#getGpuPreference]] must read it synchronously before app-ready — the only point where hardware acceleration can still be disabled. Precedence is `HERMES_DISABLE_GPU` env (support escape hatch) > relaunch sentinel (a crash still rescues the current session even under "Always on") > preference > crash flag. Under "Always on" the crash guard relaunches with the sentinel but skips persisting the flag, so every subsequent launch retries hardware acceleration; "Always off" suppresses the crash guard and the Office banner's re-enable button (the banner points at Settings instead). [[src/main/gpu-fallback.ts#setGpuPreference]] writes the file (IPC `set-gpu-preference`, validated in the main process); changes apply after a relaunch via [[src/main/gpu-fallback.ts#relaunchApp]] (IPC `relaunch-app`). The Appearance pane (`src/renderer/src/components/settings/AppearancePane.tsx`) compares the saved preference against the `bootPreference` captured by [[src/main/gpu-fallback.ts#applyGpuPreferences]] so its "restart to apply" prompt survives closing and reopening Settings.
+
+### Renderer visibility and recovery
+
+Software rendering is no longer silent: the Office tab shows a warning banner with a one-click recovery when hardware acceleration is off.
+
+[[src/main/gpu-fallback.ts#getGpuStatus]] reports whether the GPU is disabled, why (`env` / `preference` / `sentinel` / `flag`), and whether the app can recover; [[src/main/gpu-fallback.ts#reenableGpuAndRelaunch]] deletes the flag and relaunches without the GPU-off sentinel (refused when `HERMES_DISABLE_GPU=1` forces software rendering, since a relaunch would inherit it). Both are exposed over IPC (`get-gpu-status`, `reenable-gpu`) via the preload bridge, and the Office screen (`src/renderer/src/screens/Office/Office.tsx`) renders the banner over the 3D view — the one surface where SwiftShader is painfully visible. The one-click re-enable applies only to crash fallbacks: env- and preference-forced software rendering render an informational banner without the button.
+
+## App Lifecycle
+
+Lifecycle code owns Electron windows, global app events, and shutdown cleanup.
+
+[[src/main/app/start.ts#startMainProcess]] registers crash logging, IPC handlers, updater handlers, Electron ready/activate/window-all-closed/before-quit events, CSP headers, security hardening, and the main BrowserWindow.
+
+[[src/main/app/start.ts]] also supports the `HERMES_OPEN_DEVTOOLS=1` diagnostic launch path so packaged builds can expose renderer console errors when startup fails before the UI paints.
+
+The packaged renderer keeps its meta CSP aligned with the production response CSP so file-backed startup assets load consistently from `file://` before the main-process header can help.
+
+Because electron-vite emits a bundled main file at `out/main/index.js`, packaged renderer loading resolves `../renderer/index.html` from `__dirname` to reach `out/renderer/index.html`.
+
+## App Chrome Helpers
+
+Menu, updater, and context-menu behavior live in focused modules.
+
+[[src/main/app/menu.ts#buildMenu]] owns the application menu, [[src/main/app/updater.ts#setupUpdater]] owns update IPC and electron-updater events, and [[src/main/app/context-menu.ts#showChatContextMenu]] owns the chat right-click menu.
+
+Release builds keep a Help-menu Developer Tools toggle as a production diagnostics escape hatch without changing renderer sandbox or Node isolation.
+
+## IPC Registry
+
+Renderer IPC handlers are isolated from app bootstrap so the registry can be split by domain.
+
+[[src/main/ipc/register.ts#registerIpcHandlers]] currently preserves the existing handler behavior behind one registration function. It receives app-level callbacks for the main window, model-library notifications, connection-config notifications, external URL opening, and active chat abort handles.
+
+Wallet and token-balance handlers sit in the same registry: `list-wallets`, `create-wallet`, `import-wallet`, `rename-wallet`, `delete-wallet` (backed by [[wallet-token-balances#Wallet Store]]) and `get-token-balances` (backed by [[wallet-token-balances#Token Balances]]).
+
+## Platform enable overrides
+
+Messaging platform availability combines credentials from `.env` with an optional direct-child `<platform>.enabled` override in `config.yaml`.
+
+[[src/main/config.ts#getPlatformEnabled]] ignores nested `enabled` keys, such as `discord.voice_fx.enabled`, so feature-specific settings cannot disable the whole platform.
+
+[[src/main/config.ts#setPlatformEnabled]] edits only the platform block's direct `enabled` child. It preserves unrelated YAML and the file's existing LF or CRLF line endings, and leaves the file byte-identical when the requested enabled state is already the default. This matters at application startup, where merely reading and reconciling a configured platform must not rewrite or corrupt a shared Windows `config.yaml`.
+
+## Remote Gateway management
+
+The Remote Gateway screen controls the server's gateway and messaging platforms through authenticated, profile-scoped dashboard requests.
+
+[[src/main/remote-gateway.ts#remoteGatewayStatus]] reads liveness from `/api/status`. Lifecycle commands capture a connection and explicit default or named profile, then await their matching action PID's successful exit and the requested gateway state. Restart also requires a changed live gateway PID or an observed stopped-to-running transition, because command exit can precede the restart handoff.
+
+Commands for one remote URL cannot overlap, including different profiles because the action registry is server-wide. The four-minute budget allows server-side draining; timeout retains an unconfirmed operation lock without cancelling the command. Read-only refresh confirms completion before releasing controls. Status errors, invalid JSON and replaced action records retain uncertainty.
+
+[[src/main/remote-gateway.ts#remoteGatewayAction]] returns a typed Remote action outcome through `remote-gateway-action` IPC and preload. Retained admission means `unconfirmed`; known refusal or matching failed exit means `failed`. The screen uses this kind rather than message text. Legacy Local and SSH lifecycle handlers retain their existing contracts.
+
+[[src/main/remote-gateway.ts#remoteGatewayCommandStatus]] returns read-only pending state and a matching late failure through IPC. The active view receives that terminal result once, releases controls and preserves its error. No command history is stored. Admission revisions and renderer action revisions discard refresh evidence superseded by a newer command.
+
+[[src/renderer/src/screens/Gateway/Gateway.tsx#Gateway]] keeps successful status when platform settings fail, hides local API key controls in Remote mode, and cancels pending status timers on unmount. Connection, profile, mode and configuration revisions reset its state; commands stay disabled until IPC confirms completion.
+
+[[src/renderer/src/screens/Layout/useRemoteOnlyMode.ts#useRemoteOnlyMode]] refreshes mode after connection or configuration changes, rejects late answers from earlier targets, and hides local mutation controls while the new target is unresolved.
+
+### Messaging profile isolation
+
+Remote messaging list, update and test calls retain the selected profile through IPC and the authenticated dashboard client, so a named profile's platform settings cannot fall through to the server's default profile.
+
+### Keyless messaging compatibility
+
+Explicit or auto-detected keyless token servers keep anonymous messaging access and profile scoping. OAuth login and probe failures remain errors and never retry through anonymous fetch.
+
+### Pending actions after teardown
+
+Start or Restart promises that settle after Gateway unmount cannot schedule status timers or new reads against the previous profile or connection.
+
+### Renderer mode transitions
+
+Switching connections on the same screen refreshes its Remote restrictions. Outdated mode replies cannot undo a newer answer, and in-place configuration changes invalidate prior local-control permissions until resolved.
+
+### Keyless lifecycle compatibility
+
+Explicit and resolved auto keyless token dashboards retain scoped JSON status, Start, Stop and Restart requests. OAuth or auth-probe failures never trigger anonymous requests, and HTML responses cannot become successful completion.
+
+### Keyless refusal releases admission
+
+Keyless token POST refusals retain their HTTP status so an explicit rejection releases the admission lock. A later valid command can be tracked normally, including auto-detected token dashboards.
+
+### Non-JSON refusals retain HTTP status
+
+Empty or HTML refusal bodies preserve their HTTP status and release the rejected keyless admission. Malformed successful POST responses remain uncertain because the action may have been accepted without a trackable receipt.
+
+### Remote restart failure explanation
+
+Remote restart IPC forwards the server's failure reason to Gateway. Unconfirmed-command explanations remain visible with blocked controls through status refresh and clear after confirmed reconciliation.
+
+### Lifecycle completion and overlap
+
+Stop remains pending until its matching command exits successfully and the gateway is stopped. A concurrent command for that remote server, including another profile, is rejected before another mutation is submitted.
+
+### External action preflight
+
+Before submitting a lifecycle mutation, desktop checks the server's global Start, Stop and Restart action records. Existing running commands block new mutations; idle records may legitimately have no PID or exit code.
+
+### Unconfirmed commands remain blocked
+
+An unconfirmed timeout keeps the operation, controls and error pending. Read-only refresh retains that explanation while the command is unknown or pending and releases controls only on matching completion or known terminal failure.
+
+After confirmed Stop reconciliation, the old uncertainty explanation clears even though the gateway is stopped. Ordinary terminal errors retain their own failure messages.
+
+### Terminal Gateway failure remains visible
+
+A genuine terminal Remote Stop or Restart failure remains visible when refresh reports either stopped or running. Only explanations marked as uncertain are cleared by delayed completion reconciliation.
+
+### Pending reads preserve command meaning
+
+A typed command outcome determines failure versus uncertainty. Read errors or pending flags affect controls only; a matching terminal result carries failure meaning and cannot be overwritten by a later idle refresh.
+
+### Remote-only action transport
+
+The action IPC rejects Local, SSH and invalid actions before dispatch. Supported Remote actions retain the helper's typed failure meaning through IPC; legacy local lifecycle signatures remain unchanged.
+
+### Completion read failure classification
+
+Accepted Stop and Restart commands keep an unconfirmed outcome after network, HTTP or JSON completion-read failures. Matching later reconciliation releases the retained record; known command exit failures are classified as failed.
+
+### Completion read errors reconcile in Gateway
+
+Gateway retains unconfirmed network, HTTP and JSON errors while completion is pending, then clears them after matching reconciliation. Known command failures remain visible independently of subsequent pending reads.
+
+### Uncertain dispatch and explicit refusals
+
+A reservation exists before dispatch because an HTTP failure can hide an accepted command. Missing admission PID remains uncertain; explicit HTTP refusals release the reservation because the server rejected the mutation.
+
+### Refresh preserves newer operations
+
+A delayed refresh can clear only the operation it inspected. It cannot remove a newer command's retained record or report idle while another admission is in progress.
+
+### Restart handoff evidence
+
+A finished restart command with the old gateway still alive remains pending. A replacement live PID or observed stopped-to-running transition proves the requested handoff completed.
+
+### Strict completion status
+
+Status authentication failures and unknown response shapes cannot be interpreted as a stopped gateway when confirming Stop.
+
+### Lifecycle target snapshot
+
+Changing connection configuration during an accepted command cannot retarget its completion polls or credentials; they retain the captured server and profile.
+
+### Pending lifecycle controls
+
+Start, Stop and Restart buttons remain disabled while their IPC result is pending, so server action admission does not release controls before completion.
+
+### Gateway target resets
+
+In-place connection edits reset Gateway state and discard a prior target's late command result and status timer. The configuration listener is removed when the screen unmounts.
+
+### Remote Start post-completion liveness
+
+A completed Remote Start retains the five-second liveness check and reports if the gateway exits immediately afterward. The check is cancelled or ignored when its target screen unmounts.
+
+### Late command outcomes reach the view
+
+A matching late successful exit clears uncertainty; a matching failed exit returns its terminal error with pending false. The failure is delivered to the active refresh without retaining command history.
+
+### Stale refresh cannot report old failure
+
+A delayed old-operation refresh cannot erase a newer retained record or publish its old failure after a newer admission. Admission revisions invalidate old idle evidence even if the newer command has already finished.
+
+### Gateway renders late command failure
+
+When an uncertain Stop or Restart later exits unsuccessfully, Gateway replaces the uncertainty explanation with the matching failure and releases controls. Later idle refreshes preserve that terminal failure.
+
+### Refresh replies cannot undo a newer action
+
+Beginning a new action invalidates earlier renderer refreshes. Delayed idle or failure replies cannot release its pending controls, clear its uncertainty explanation or overwrite it with an older command's error.
+
+### Healthy Remote Gateway load
+
+A healthy Remote fixture provides the typed command-status bridge, shows running status and enabled controls without a load warning, and never reads or displays the desktop's local API server key.
+
+## Voice transcription IPC
+
+Speech-to-text IPC sends recorded desktop audio through the Hermes API server, not through the active chat model endpoint.
+
+[[src/main/ipc/register.ts#registerIpcHandlers]] exposes `transcribe-audio` for the preload bridge, and [[src/main/hermes.ts#transcribeAudio]] posts a base64 data URL to `/api/audio/transcribe`. If the local gateway lacks that desktop route, it falls back to the Python `tools.transcription_tools.transcribe_audio` dispatcher, so local Whisper, Groq, OpenAI, ElevenLabs, and command/plugin STT providers remain independent from the selected chat model.
+
+## MiniMax speech synthesis
+
+Local agent message actions can request spoken audio without exposing speech credentials to the renderer.
+
+[[speech-playback]] defines selected Local target authority, one playback owner, request cancellation, bounded encoded synthesis and scoped speech settings. [[speech-playback-tests]] documents actual IPC and rendered lifecycle regressions.
+
+## SSH credential persistence
+
+Every Desktop SSH `.env` update uses a remote-side locked transaction, so overlapping dashboard, API-server, and provider writes preserve unrelated credentials.
+
+[[src/main/ssh-remote.ts#sshSetEnvValue]], [[src/main/ssh-remote.ts#sshEnsureDashboardToken]], and [[src/main/ssh-remote.ts#sshEnsureApiServerKey]] share [[src/main/ssh-env-update.ts#REMOTE_ENV_UPDATE_SCRIPT]]. Dashboard port persistence uses the same setter. Paths and values travel as JSON on stdin, never as credential-bearing shell arguments.
+
+The Python standard-library helper locks a stable sibling `.env.lock` before reading, choosing credentials, or updating keys. It writes and fsyncs a same-directory temporary file before atomic replacement; read, metadata, write, and replacement failures propagate without a truncation fallback. Existing owner/group, mode, ACLs, extended attributes, and security labels are preserved, symlinks keep pointing to their resolved target, and first-time provisioning creates a missing file with mode 0600. Lock acquisition times out after ten seconds. The lock file remains in place so waiting processes always lock the same inode.
+
+This lock coordinates Desktop writers across processes and connections. Independent Agent or manual writers do not yet share it; their updates should not be run concurrently with Desktop credential changes. A mounted file that cannot be atomically replaced produces an error instead of an unsafe in-place overwrite.
+
+### Concurrent writers
+
+Independent token, port, API-server, and provider updates wait for the same remote lock and preserve all unrelated credentials and each other's completed changes.
+
+### Stable provisioning
+
+Simultaneous connections generate a missing token or API key only once, reuse the stored value, and canonicalize duplicate assignments while preserving unrelated lines.
+
+### Security metadata
+
+Atomic replacement preserves file-specific ACLs and extended attributes, including Linux security labels. Unsupported or failed metadata preservation aborts the update without replacing the original.
+
+Linux uses Python's xattr APIs; macOS uses [Apple's fcopyfile](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/copyfile.3.html) for ACLs and extended attributes. Custom file flags are rejected rather than silently discarded.
+
+### Failure preservation
+
+Read, fsync, and replacement failures leave the original credential file byte-identical, clean up temporary files, and reach the caller as errors.
+
+## SSH login shell
+
+[[src/main/ssh-remote.ts#sshExec]] wraps POSIX commands with [[src/main/ssh-command.ts#buildSshRemoteCommand]] so a fish login shell cannot reinterpret assignments or control flow. Remote hosts must provide `/bin/sh`.
+
+### Explicit POSIX interpreter
+
+The outer command uses `exec /bin/sh -c`, leaving stdin available for existing Python and file-write operations. Interactive shell configuration and the user's login shell are not changed.
+
+### Command byte preservation
+
+Quotes and backslashes are escaped outside single-quoted spans, preserving command bytes under both fish and POSIX parsing. POSIX-only single quoting is insufficient because fish also interprets backslashes within single quotes.
+
+CI installs fish and sets `HERMES_TEST_FISH=1`, running the same byte, stdin, stderr and exit-status checks through both parsers on every PR. A missing fish binary fails these checks; it does not silently skip them.
+
+### Input and failure preservation
+
+The wrapper forwards stdin, stdout, stderr and exit status unchanged. SSH errors continue through the existing sanitizer and timeout handling.
+
+### Live fish endpoint
+
+Opt-in tests exercise real OpenSSH with a disposable root account using fish: POSIX commands, dashboard probing, token and port persistence, file stdin, health checks, failure feedback and retry.
+
+Set `HERMES_TEST_SSH_KEY` to an ephemeral key and optionally `HERMES_TEST_SSH_PORT` (default 19322) for a disposable loopback SSH container. Provide Python 3, `/bin/sh`, fish as root's login shell, and an HTTP `/health` fixture on container port 19864. Run `vitest run tests/ssh-login-shell-live.test.ts`. These tests write fixture data under the container's `~/.hermes`; never point them at a real account.
+
+## SSH dashboard transport
+
+SSH mode has two chat transports because the remote serves chat from **two different servers**, and the desktop must reach the right one.
+
+Direct Remote mode also supports browser-authenticated dashboards through [[remote-dashboard-oauth]], while SSH stays on its existing session-token transport.
+
+The dashboard is **not** a `/v1` superset (a long-standing misconception in earlier comments): `hermes_cli/web_server.py` has no `/v1/chat`, `/v1/responses`, or `/v1/runs` routes and does not proxy `/v1` to the gateway.
+
+- **Gateway api_server** (port 8642, `API_SERVER_KEY` auth) serves `/v1` chat (`/v1/chat/completions`, `/v1/responses`, `/v1/runs`) + `/health`. This is the **no-build** transport — no Node, no web dist — used by `remote` mode and the SSH gateway fallback. See [[main-process#SSH api_server provisioning]].
+- **Dashboard** (`hermes dashboard`, port 9119, session-token auth) serves the model library, session list (`/api/*`), and the chat **WebSocket** (`/api/ws`) — surfaces the gateway api_server does not. Local chat uses `/api/ws`; over SSH the renderer's dashboard transport uses it too, when a dashboard is available.
+
+[[src/main/ssh-remote.ts#sshEnsureDashboard]] ensures the gateway is up, builds the web dist if missing ([[src/main/ssh-remote.ts#sshEnsureDashboardDist]] resolves the real install root via [[src/main/ssh-remote.ts#sshResolveDashboardRoot]] — a system-wide install lives at `/usr/local/lib/hermes-agent`, NOT under `$HOME`, so a hardcoded `~/.hermes/hermes-agent` path wrongly reported "no web dist" and forced every connection into basic chat; it now detects an already-built dist wherever hermes lives, or builds it with the vendored Node at `~/.hermes/node`, single shared in-flight build), then starts the **unified machine** `hermes dashboard --host 127.0.0.1 --port <port> --no-open --skip-build` ([[src/main/ssh-remote.ts#sshStartDashboard]]) with the session token in its env. **One dashboard serves every profile** (no `--profile`, no `--isolated`): `ensureDashboardInner` is machine-scoped (profile=undefined → default port + default token), and per-profile data is selected per-request via `?profile=` ([[src/main/remote-sessions.ts#RemoteSessionConfig]]`.profile`, applied in `dashboardApiUrl`). This is REQUIRED because the desktop has a single global SSH tunnel that can only point at one remote port: the desktop queries multiple profiles at once (e.g. `default` for the machine view + the active named profile), so per-profile dashboard ports (an earlier `--isolated` attempt) made those concurrent queries resolve different ports and thrash the one tunnel ("SSH tunnel is not active"). Readiness requires both the public `/api/status` probe ([[src/main/ssh-remote.ts#sshWaitDashboardReady]], [[src/main/ssh-remote.ts#sshDashboardRunning]]) and an authenticated `/api/sessions` probe ([[src/main/ssh-remote.ts#sshDashboardAuthenticated]]). If the preferred port belongs to a stale dashboard with another token or an unrelated HTTP service, the desktop leaves that process alone, allocates a free loopback port, and persists it as `HERMES_DESKTOP_DASHBOARD_PORT` (one canonical line, deduped) in the **default** `.env`. [[src/main/dashboard.ts#sshDashboardConnectionFromConfig]] and [[src/main/ipc/register.ts#getSshDashboardSessionConfig]] then `ensureSshTunnel` to that single dashboard port and build the connection (model library, sessions, and the `/api/ws` chat WS), carrying the requested `profile`.
+
+Because the dashboard is machine-unified, an **unscoped** request silently answers with the **default** profile's data — a named-profile user would get the default session list and open the wrong transcript. Session and metadata IPC handlers (`list-sessions`, `get-session-messages`, delete/title/search/cache ops, hermes version/home, model config) therefore default the dashboard profile to the locally persisted active profile via [[src/main/ipc/register.ts#activeSshProfile]] (explicit renderer-passed profiles win; `"default"` and already-explicit params like the session list's `profile=all` are handled in `dashboardApiUrl`). [[src/main/remote-metadata.ts]]'s `/api/status` probe shares [[src/main/dashboard-api-url.ts#dashboardApiUrl]] rather than building its own URL, so status-derived surfaces (Hermes home/version) are scoped the same way.
+
+The same metadata reader supports direct raw api_server connections. [[src/main/remote-metadata.ts#remoteGetHermesVersion]] and [[src/main/remote-metadata.ts#remoteGetHermesHome]] fall back from an absent dashboard `/api/status` (`404`/`405`) to bearer-authenticated `/health`; a plain health body means no optional metadata rather than a connection failure.
+
+**Every** SSH tunnel entry point that prepares chat — the `send-message` preamble and the `start-ssh-tunnel` IPC handler — routes through [[src/main/ipc/register.ts#prepareSshTunnel]]. When an authenticated dashboard is available it tunnels to the dashboard port and caches the dashboard token; otherwise (gateway-only installs with no web dist, or `legacy` transport) it provisions and tunnels to the gateway `/v1` port. This single funnel matters because the tunnel is one global resource: a path tunnelling to 8642 while another used 9119 would thrash it (each `startSshTunnel` first `stopSshTunnel`s), surfacing as "SSH tunnel is not active". The `before-quit` handler in [[src/main/app/start.ts#startMainProcess]] calls `stopSshTunnel()` on exit — without it the `ssh -N -L` child is orphaned (reparented to PID 1) and keeps holding its local port, so each relaunch leaks another tunnel and the port drifts (18642 → 61799 → …). When the dashboard can't run, `sshEnsureDashboard` returns `null`: `auto` degrades quietly to the gateway `/v1` path for chat and legacy CLI/SSH-exec ops for `withSshDashboardModelLibrary`/`withSshDashboardSessions`, while a forced `dashboard` transport surfaces the error.
+
+The dashboard is "ensured" on every chat/model-library/session op, so `sshEnsureDashboard` is guarded against a spawn spiral: an in-flight promise collapses a connect storm into one probe, and a ~60s negative cache (`dashboardUnavailableUntil`, cleared by [[src/main/ssh-remote.ts#resetSshDashboardAvailability]] on connection-config change) short-circuits to the gateway path. The negative cache latches **only for the permanent case** — the remote has no buildable web dist — never for a transient (dashboard still starting, a readiness/auth blip): caching a transient would force chat's `prepareSshTunnel` onto the gateway `/v1` tunnel (8642) while model-library still targets the dashboard port, thrashing the single global tunnel ("SSH tunnel is not active" / 405). [[src/main/ssh-remote.ts#sshStartGateway]] carries the same in-flight dedup (and re-checks status inside the guard). Without these, concurrent ops each found "no gateway/dashboard", launched their own, and on a small remote the duplicates OOM-killed each other — the desktop then saw "not running" and respawned, wedging the box. The dashboard cache/in-flight keys are **machine-scoped** (host:port:user, not per-profile, since one dashboard serves all profiles), so the whole connect storm collapses to a single probe and a single tunnel.
+
+Because the launch-time SSH connect (the splash "Starting SSH tunnel…" step in [[src/renderer/src/App.tsx#App]]'s `runInstallCheck`) can be slow on first connect or stall on an unreachable host, [[src/renderer/src/screens/SplashScreen/SplashScreen.tsx]] shows a "Switch to local mode" escape hatch after a delay so the user is never trapped. It reuses `handleSwitchToLocal`, which stops any in-flight tunnel, persists `local` mode, and re-runs the check; `runInstallCheck` carries a generation guard (`runIdRef`) so the abandoned SSH run can't clobber the local run's screen transition.
+
+## SSH api_server provisioning
+
+The gateway `/v1` chat path is the no-build SSH transport (and the only one on gateway-only installs that lack the dashboard web dist), but it requires the remote api_server to be configured — which SSH mode, unlike local mode, never did.
+
+The gateway only loads the api_server platform when `API_SERVER_ENABLED` is truthy (`gateway/config.py`), and the api_server refuses to bind without `API_SERVER_KEY`. Local mode writes both via `startGateway`; SSH mode previously only **read** the key, so a fresh server had no `/v1` endpoint at all and every chat failed. [[src/main/ssh-remote.ts#sshEnsureApiServerKey]] now ensures both on the remote `.env` (per profile): it generates + writes `API_SERVER_KEY` when missing/invalid (the remote transaction rejects empty, <16-character, and placeholder keys) and sets `API_SERVER_ENABLED=true`, returning whether anything was written. [[src/main/ipc/register.ts#prepareSshTunnel]]'s gateway branch calls it, then starts the gateway if down — or stops+starts it when the env was just written so the running gateway picks up the new api_server config — and waits for the api_server `/health` ([[src/main/ssh-remote.ts#sshWaitGatewayApiReady]]) before opening the tunnel, so the first chat doesn't race "tunnel health check failed". A `false` readiness result (health never bound within the timeout — fresh or slow remotes) makes `prepareSshTunnel` **throw** instead of opening the tunnel and caching the key: reporting success with an unbound `/v1` just deferred the failure to the first chat with a less actionable connection error. Chat then POSTs `/v1` over the tunnel with that key cached via `setSshRemoteApiKey`.
+
+These `.env` writes use [[main-process#SSH credential persistence]], which rewrites the first matching line and **drops any later duplicates** under the shared remote lock. Both `sshReadEnv` and the remote gateway's dotenv are last-wins, and pre-dedup desktops left `.env` files with several `API_SERVER_KEY` lines — replacing only the first while a stale later line survived meant the gateway kept the old key while the desktop cached the new one, a permanent 401. Writes self-heal that corruption, matching the canonical-line writers used for the dashboard token and port.
+
+## SSH credential resolution
+
+The credential depends on which transport is active. Over the **dashboard** the **session token** is used; over the **gateway `/v1`** path the remote **`API_SERVER_KEY`** is used.
+
+The dashboard's `/api/*` routes (and its `/api/ws` chat WS) reject the api_server key (401) and accept only `HERMES_DASHBOARD_SESSION_TOKEN`. [[src/main/ssh-remote.ts#sshEnsureDashboardToken]] reads the token from the remote `.env` (per profile), generating + persisting one when absent so it stays stable across reconnects and is shared by the remote dashboard process and the desktop. It writes exactly one canonical line (stripping any duplicates) under an in-flight guard — the dashboard is ensured on every chat/model-library/session op, and the old unguarded `printf >>` let concurrent first-connect callers append divergent tokens (observed as 9 conflicting lines in one `.env`, where dotenv's last-wins value drifted from a caller's cached token → 401). [[src/main/ssh-remote.ts#sshEnsureApiServerKey]] carries the same guard for the gateway `/v1` key. The desktop caches it via `setSshRemoteApiKey`. The SSH form has no API-key field (only **remote** mode does, [[src/renderer/src/components/settings/ConnectionPane.tsx]]), so the shared `conn.apiKey` is never used for SSH — avoiding the stale-key 401s the old `conn.apiKey || …` precedence caused. On the gateway `/v1` path the credential is the remote `API_SERVER_KEY`, provisioned by [[src/main/ssh-remote.ts#sshEnsureApiServerKey]] and read via [[src/main/ssh-remote.ts#sshReadRemoteApiKey]].
+
+## Dotted configuration lookup
+
+Configuration reads follow direct mapping children so a nested feature setting cannot masquerade as a root or parent-level option.
+
+[[src/main/yaml-path.ts#getYamlPath]] walks each dotted segment within its parent block, pins the first segment to column zero, and stops at parent boundaries. Its scan position advances after each match, avoiding rescans of earlier lines. Scalar parents cannot be traversed, including block text whose lines resemble configuration keys. This matches the Agent's nested dictionary lookup semantics for the supported config subset.
+
+### Root and parent boundaries
+
+A flat key resolves only at column zero, even when indented content precedes it; dotted paths cannot use an indented root or escape their parent block.
+
+### Scalar parents
+
+A path through scalar text or an inline collection returns null instead of interpreting later indented text as mapping children.
+
+### Nested siblings
+
+Deep lookups skip unrelated sibling subtrees and comments, support consistent nondefault indentation, and cannot resolve a leaf outside the selected parent.
+
+## Native SSH session deletion
+
+Legacy SSH sessions can be deleted without a dashboard. The selected connection and profile determine the database, and unselected child history and its conversation classification are preserved.
+
+[[src/main/ipc/register.ts#withSshDashboardSessions]] uses [[src/main/ssh-remote.ts#sshDeleteSession]] and [[src/main/ssh-remote.ts#sshDeleteSessions]] as the legacy/auto fallbacks. [[src/main/ssh-session-delete.ts#SSH_SESSION_DELETE_SCRIPT]] receives JSON via stdin, validates the profile, and uses parameterized SQL in one `BEGIN IMMEDIATE` transaction. It removes selected messages and optional desktop metadata, records hidden-child classification in a desktop-owned exclusion table, detaches children, and rolls the whole batch back on failure. Agent model metadata and schema versions are unchanged. The database is opened in existing-file mode; a missing database is not created. SSH errors propagate to the renderer. The SSH session listing reads state.db directly using [[sidebar-navigation#Conversations, not child sessions]], so no local cache or user files are touched. Tests: [[ssh-session-delete]].
+
+[[src/renderer/src/screens/Sessions/Sessions.tsx#Sessions]] keeps rows until deletion is acknowledged, reports failures, and refreshes after the attempt. In-flight results are discarded after changing connection/profile, updating connection settings, or unmounting. Confirmation remains explicit and concurrent delete submissions are blocked.
+
+The deletion command passes through [[src/main/ssh-command.ts#buildSshRemoteCommand]] before SSH executes it, preserving the POSIX interpreter boundary while leaving the selected IDs and profile on stdin.
+
+## Deferred Office loading
+
+The renderer imports Office only when that tab is first visited, so Chat startup does not depend on loading the optional Three.js scene.
+
+[[src/renderer/src/screens/Layout/Layout.tsx#Layout]] retains the existing visited-tab lifecycle with a Suspense boundary. [[electron.vite.config.ts]] discovers the Office dependency graph together, including SkeletonUtils, during dev prebundling. Production emits an independent Office chunk; switching tabs preserves its mounted state.

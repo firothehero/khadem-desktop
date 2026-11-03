@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { join } from "path";
-import { mkdirSync, rmSync, existsSync } from "fs";
+import {
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 
 // vi.hoisted runs before module imports, so we can't reference imported
 // helpers here — use the bare Node modules via require.
@@ -25,10 +32,48 @@ vi.mock("../src/main/installer", () => ({
   getEnhancedPath: () => process.env.PATH || "",
 }));
 
+vi.mock("../src/main/utils", () => ({
+  activeStateDbPath: (profile?: unknown) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path");
+    const home =
+      profile && profile !== "default"
+        ? path.join(TEST_HOME, "profiles", String(profile))
+        : TEST_HOME;
+    return path.join(home, "state.db");
+  },
+  profileHome: (profile?: unknown) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("path");
+    return profile && profile !== "default"
+      ? path.join(TEST_HOME, "profiles", String(profile))
+      : TEST_HOME;
+  },
+  getActiveProfileNameSync: () => "default",
+  safeWriteFile: (path: string, data: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const nodePath = require("path");
+    fs.mkdirSync(nodePath.dirname(path), { recursive: true });
+    fs.writeFileSync(path, data, "utf-8");
+  },
+}));
+
 // Stub the i18n + locale modules so the cache code doesn't need the
 // renderer-side translation files at test time.
 vi.mock("../src/shared/i18n", () => ({
-  t: (key: string) => key,
+  t: (key: string, _lang?: string, options?: Record<string, unknown>) => {
+    const messages: Record<string, string> = {
+      "sessions.newConversation": "sessions.newConversation",
+      "sessions.renameInvalid": "Enter a valid name (max 100 characters)",
+      "sessions.renameTooLong": `Title too long (max ${options?.max ?? 100} characters)`,
+      "sessions.renameUnavailable": "Session database unavailable",
+      "sessions.renameDuplicate": `Title "${options?.title ?? ""}" is already in use`,
+      "sessions.renameNotFound": "Session not found",
+    };
+    return messages[key] ?? key;
+  },
 }));
 vi.mock("../src/main/locale", () => ({
   getAppLocale: () => "en",
@@ -125,36 +170,63 @@ vi.mock("better-sqlite3", () => {
         return { changes: 1 };
       }
 
+      // Desktop rename path — mirrors Hermes `idx_sessions_title_unique`
+      // (NULLs allowed; non-NULL titles must be unique across sessions).
+      if (
+        this.sql.includes("UPDATE sessions SET title") &&
+        this.sql.includes("WHERE id = ?")
+      ) {
+        const [title, id] = args;
+        const session = this.store.sessions.get(String(id));
+        if (!session) return { changes: 0 };
+        const nextTitle =
+          title === null || title === undefined ? null : String(title);
+        if (nextTitle !== null) {
+          for (const other of this.store.sessions.values()) {
+            if (other.id !== session.id && other.title === nextTitle) {
+              const err = new Error(
+                "UNIQUE constraint failed: sessions.title",
+              ) as Error & { code: string };
+              err.code = "SQLITE_CONSTRAINT_UNIQUE";
+              throw err;
+            }
+          }
+        }
+        session.title = nextTitle;
+        return { changes: 1 };
+      }
+
       throw new Error(`Unhandled fake run SQL: ${this.sql}`);
     }
 
-    all(
-      ...args: unknown[]
-    ): SessionRow[] | Array<{ id: string; message_count: number }> {
+    all(): SessionRow[] {
+      // These legacy fixtures predate the Agent's archive column.
+      if (this.sql === "PRAGMA table_info(sessions)") return [];
       if (this.sql.includes("FROM sessions s")) {
-        const threshold = Number(args[0] ?? 0);
-        return Array.from(this.store.sessions.values())
-          .filter((session) => session.started_at > threshold)
-          .sort((a, b) => b.started_at - a.started_at);
+        return Array.from(this.store.sessions.values()).sort(
+          (a, b) => b.started_at - a.started_at,
+        );
       }
 
-      // Phase-2 refresh query introduced for issue #226:
-      //   SELECT id, message_count FROM sessions WHERE id IN (?, ?, …)
-      if (
-        this.sql.includes("SELECT id, message_count FROM sessions") &&
-        this.sql.includes("WHERE id IN")
-      ) {
-        const ids = args.map(String);
-        return ids
-          .map((id) => this.store.sessions.get(id))
-          .filter((s): s is SessionRow => !!s)
-          .map((s) => ({ id: s.id, message_count: s.message_count }));
+      // Context-folder batch read (issue #27). These tests never seed linked
+      // folders, so report none — `tableExists` returns false above, so this
+      // is only a defensive fallback if the lookup path ever changes.
+      if (this.sql.includes("desktop_session_context_folders")) {
+        return [];
       }
 
       throw new Error(`Unhandled fake all SQL: ${this.sql}`);
     }
 
-    get(...args: unknown[]): { content: string } | undefined {
+    get(...args: unknown[]): { content: string } | { id: string } | undefined {
+      // `tableExists` probes sqlite_master before reading context folders
+      // (issue #27). The desktop context-folder table is never created in
+      // these tests, so report it absent — sessions then resolve to a null
+      // contextFolder instead of throwing on an unhandled query.
+      if (this.sql.includes("sqlite_master")) {
+        return undefined;
+      }
+
       if (this.sql.includes("SELECT content FROM messages")) {
         const sessionId = String(args[0]);
         const match = this.store.messages
@@ -168,6 +240,20 @@ vi.mock("better-sqlite3", () => {
         return match ? { content: match.content } : undefined;
       }
 
+      // Uniqueness probe used by updateSessionTitle before writing.
+      if (
+        this.sql.includes("SELECT id FROM sessions") &&
+        this.sql.includes("WHERE title = ?") &&
+        this.sql.includes("AND id != ?")
+      ) {
+        const [title, sessionId] = args;
+        const match = Array.from(this.store.sessions.values()).find(
+          (session) =>
+            session.title === String(title) && session.id !== String(sessionId),
+        );
+        return match ? { id: match.id } : undefined;
+      }
+
       throw new Error(`Unhandled fake get SQL: ${this.sql}`);
     }
   }
@@ -176,6 +262,15 @@ vi.mock("better-sqlite3", () => {
     private readonly store: Store;
 
     constructor(dbPath: string) {
+      // Lets a test stand up a state.db that exists on disk but cannot be
+      // opened — locked, or corrupt — which is how `getDb()` returns null
+      // while the file itself is still present.
+      if (
+        fs.existsSync(dbPath) &&
+        fs.readFileSync(dbPath, "utf-8") === "CORRUPT"
+      ) {
+        throw new Error("unable to open database file");
+      }
       this.store = getStore(dbPath);
     }
 
@@ -196,10 +291,21 @@ vi.mock("better-sqlite3", () => {
 });
 
 import Database from "better-sqlite3";
-import { syncSessionCache } from "../src/main/session-cache";
+import {
+  listCachedSessions,
+  syncSessionCache,
+  updateSessionTitle,
+  type CachedSession,
+} from "../src/main/session-cache";
+import { closeDbConnection } from "../src/main/db";
 
 const CACHE_FILE = join(TEST_HOME, "desktop", "sessions.json");
-const DB_PATH = join(TEST_HOME, "state.db");
+
+function testProfileHome(profile = "default"): string {
+  return profile === "default"
+    ? TEST_HOME
+    : join(TEST_HOME, "profiles", profile);
+}
 
 function seedDb(
   sessions: Array<{
@@ -211,8 +317,9 @@ function seedDb(
     title?: string | null;
     firstUserMessage?: string;
   }>,
+  profile = "default",
 ): void {
-  const db = new Database(DB_PATH);
+  const db = new Database(join(testProfileHome(profile), "state.db"));
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
@@ -259,12 +366,32 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  closeDbConnection();
   if (existsSync(TEST_HOME)) {
     rmSync(TEST_HOME, { recursive: true, force: true });
   }
 });
 
 describe("syncSessionCache", () => {
+  // @lat: [[session-title-generation#Automatic session title generation#Unicode truncation]]
+  it.each([
+    ["😀".repeat(20), "😀".repeat(20)],
+    ["a".repeat(60), "a".repeat(45) + "..."],
+    ["中".repeat(43) + "😀" + "文".repeat(20), "中".repeat(43) + "😀..."],
+    ["😀".repeat(30), "😀".repeat(22) + "..."],
+    ["😀".repeat(60), "😀".repeat(22) + "..."],
+    ["中".repeat(44) + "😀" + "文".repeat(20), "中".repeat(44) + "..."],
+  ])(
+    "preserves Unicode characters in generated titles",
+    (message, expected) => {
+      seedDb([
+        { id: "unicode-title", started_at: 1, firstUserMessage: message },
+      ]);
+      expect(syncSessionCache()[0].title).toBe(expected);
+      expect(listCachedSessions()[0].title).toBe(expected);
+    },
+  );
+
   it("returns an empty list when no DB exists yet", () => {
     expect(syncSessionCache()).toEqual([]);
   });
@@ -296,9 +423,71 @@ describe("syncSessionCache", () => {
     expect(existsSync(CACHE_FILE)).toBe(true);
   });
 
+  // @lat: [[connections#Test specifications#Connection-explicit session browsing#Keeps Local profile caches isolated]]
+  it("reads and writes only the explicitly selected Local profile", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: "default-session",
+        started_at: now,
+        firstUserMessage: "Default profile",
+      },
+    ]);
+    seedDb(
+      [
+        {
+          id: "work-session",
+          started_at: now + 1,
+          firstUserMessage: "Work profile",
+        },
+      ],
+      "work",
+    );
+
+    expect(syncSessionCache("work").map((session) => session.id)).toEqual([
+      "work-session",
+    ]);
+    expect(
+      existsSync(join(testProfileHome("work"), "desktop", "sessions.json")),
+    ).toBe(true);
+    expect(syncSessionCache().map((session) => session.id)).toEqual([
+      "default-session",
+    ]);
+  });
+
+  it("treats an empty cache with a stale lastSync as a cold cache", () => {
+    const oldStart = Math.floor(Date.now() / 1000) - 86400 * 14;
+    seedDb([
+      {
+        id: "old-hidden-session",
+        started_at: oldStart,
+        message_count: 3,
+        firstUserMessage: "Recover this older session",
+      },
+    ]);
+
+    mkdirSync(join(TEST_HOME, "desktop"), { recursive: true });
+    writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({
+        sessions: [],
+        lastSync: Math.floor(Date.now() / 1000),
+      }),
+      "utf-8",
+    );
+
+    const result = syncSessionCache();
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: "old-hidden-session",
+      messageCount: 3,
+    });
+    expect(result[0].title).toContain("Recover this older session");
+  });
+
   it("updates messageCount on existing sessions without duplicating them (issue #16 regression)", () => {
-    // Use a future started_at so the 5-minute incremental sync window
-    // (lastSync - 300) still catches the row on the second sync.
+    // A future timestamp must not create a duplicate on subsequent syncs.
     const future = Math.floor(Date.now() / 1000) + 600;
     seedDb([
       {
@@ -357,12 +546,9 @@ describe("syncSessionCache", () => {
     expect(result.map((r) => r.id)).toEqual(["s2", "s1"]);
   });
 
-  it("refreshes messageCount for old sessions outside the lastSync window (issue #226)", () => {
-    // Session started well before the 5-minute incremental sync window
-    // looks (lastSync - 300). Without the Phase 2 refresh, the cache
-    // pegs messageCount at whatever was first observed — the user
-    // reports the symptom as "messageCount records only 15 messages
-    // when there are actually 200+".
+  it("refreshes messageCount even when creation time is unchanged (issue #226)", () => {
+    // Old conversations can keep accumulating messages. A creation-time
+    // cursor alone would leave their counts stuck at the first observed value.
     const oldStart = Math.floor(Date.now() / 1000) - 86400 * 30; // 30 days ago
     seedDb([
       {
@@ -393,15 +579,57 @@ describe("syncSessionCache", () => {
     expect(second).toHaveLength(1);
     expect(second[0].id).toBe("old-session");
     expect(second[0].messageCount).toBe(200);
-    // Title and other metadata are preserved (Phase 2 only touches the
-    // count field — no re-running of title generation).
+    // A generated title is reused without rereading the first user message.
     expect(second[0].title).toContain("first");
   });
 
+  it("prunes cached sessions that no longer exist in state.db", () => {
+    const oldStart = Math.floor(Date.now() / 1000) - 86400 * 14;
+    seedDb([
+      {
+        id: "still-present",
+        started_at: oldStart,
+        message_count: 3,
+        firstUserMessage: "keep me",
+      },
+    ]);
+
+    mkdirSync(join(TEST_HOME, "desktop"), { recursive: true });
+    writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({
+        sessions: [
+          {
+            id: "already-deleted",
+            title: "Already deleted",
+            startedAt: oldStart,
+            source: "api_server",
+            messageCount: 1,
+            model: "gpt-5.5",
+          },
+          {
+            id: "still-present",
+            title: "Keep me",
+            startedAt: oldStart,
+            source: "api_server",
+            messageCount: 1,
+            model: "gpt-5.5",
+          },
+        ],
+        lastSync: Math.floor(Date.now() / 1000),
+      }),
+      "utf-8",
+    );
+
+    const result = syncSessionCache();
+
+    expect(result.map((s) => s.id)).toEqual(["still-present"]);
+    expect(result[0].messageCount).toBe(3);
+  });
+
   it("refreshes some old, leaves others untouched, all in one sync", () => {
-    // Mix: one session inside the lastSync window (handled by Phase 1)
-    // and two outside it (handled by Phase 2). All three counts grow
-    // between syncs; both phases should keep the cache accurate.
+    // Mix old and future-dated sessions. Counts must stay accurate for
+    // all of them, independent of their creation times.
     const now = Math.floor(Date.now() / 1000);
     const oldA = now - 86400 * 7;
     const oldB = now - 86400 * 3;
@@ -457,6 +685,40 @@ describe("syncSessionCache", () => {
     expect(byId.get("new-c")?.messageCount).toBe(7);
   });
 
+  it("updates title and model on existing sessions when DB values change", () => {
+    const future = Math.floor(Date.now() / 1000) + 600;
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 2,
+        model: "gpt-4o",
+        title: "Old title",
+        firstUserMessage: "hi",
+      },
+    ]);
+    const first = syncSessionCache();
+    expect(first[0].title).toBe("Old title");
+    expect(first[0].model).toBe("gpt-4o");
+
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 5,
+        model: "claude-sonnet-4-20250514",
+        title: "Updated title",
+        firstUserMessage: "hi",
+      },
+    ]);
+    const second = syncSessionCache();
+
+    expect(second).toHaveLength(1);
+    expect(second[0].title).toBe("Updated title");
+    expect(second[0].model).toBe("claude-sonnet-4-20250514");
+    expect(second[0].messageCount).toBe(5);
+  });
+
   it("handles a large existing cache without quadratic blowup (issue #16)", () => {
     // 1500 existing sessions in cache, then sync sees same 1500 but with
     // bumped message counts. The pre-fix O(N²) implementation took >2s here
@@ -483,4 +745,255 @@ describe("syncSessionCache", () => {
     expect(result.every((r) => r.messageCount === 2)).toBe(true);
     expect(elapsed).toBeLessThan(500);
   }, 30000);
+});
+
+describe("updateSessionTitle", () => {
+  // @lat: [[sidebar-navigation#Sidebar recent sessions#Row context menu#Rename persistence]]
+  it("persists a rename to state.db so the next sync keeps the new title", () => {
+    const future = Math.floor(Date.now() / 1000) + 600;
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 2,
+        title: "Old title",
+        firstUserMessage: "hi",
+      },
+    ]);
+    syncSessionCache();
+
+    updateSessionTitle("s1", "Renamed chat");
+
+    expect(listCachedSessions(10)[0]?.title).toBe("Renamed chat");
+    const afterSync = syncSessionCache();
+    expect(afterSync[0]?.title).toBe("Renamed chat");
+  });
+
+  it("rejects duplicate titles without leaving a dirty cache entry", () => {
+    const future = Math.floor(Date.now() / 1000) + 600;
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 1,
+        title: "Taken name",
+        firstUserMessage: "one",
+      },
+      {
+        id: "s2",
+        started_at: future + 1,
+        message_count: 1,
+        title: "Other chat",
+        firstUserMessage: "two",
+      },
+    ]);
+    syncSessionCache();
+
+    expect(() => updateSessionTitle("s2", "Taken name")).toThrow(
+      /already in use/i,
+    );
+
+    const cached = listCachedSessions(10);
+    expect(cached.find((s) => s.id === "s2")?.title).toBe("Other chat");
+
+    // Sync must not have been poisoned by a cache-only write either.
+    const afterSync = syncSessionCache();
+    expect(afterSync.find((s) => s.id === "s2")?.title).toBe("Other chat");
+  });
+
+  it("throws when the session id is unknown", () => {
+    const future = Math.floor(Date.now() / 1000) + 600;
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 1,
+        title: "Exists",
+        firstUserMessage: "hi",
+      },
+    ]);
+    syncSessionCache();
+
+    expect(() => updateSessionTitle("missing", "Nope")).toThrow(/not found/i);
+  });
+
+  it("rejects empty or oversized titles before touching the DB", () => {
+    const future = Math.floor(Date.now() / 1000) + 600;
+    seedDb([
+      {
+        id: "s1",
+        started_at: future,
+        message_count: 1,
+        title: "Exists",
+        firstUserMessage: "hi",
+      },
+    ]);
+    syncSessionCache();
+
+    expect(() => updateSessionTitle("s1", "   ")).toThrow(/valid/i);
+    expect(() => updateSessionTitle("s1", "x".repeat(101))).toThrow(/100/);
+    expect(listCachedSessions(10)[0]?.title).toBe("Exists");
+  });
+});
+
+// Real session ids as `src/main/hermes.ts` generates them: authenticated
+// desktop chats get `desk-<ms>-<uuidv4>`, and the gateway's fingerprint
+// fallback gets `api-<sha256-prefix>`. Neither is a bare UUID, so these
+// double as a guard against judging a cached row by the shape of its id —
+// this keys on where the cache came from, not on what the rows look like.
+const DESK_ID = "desk-1789288537424-93cea475-ccf9-412a-84a9-e22a929ac194";
+const API_ID = "api-2cf24dba5fb0a30e";
+const DB_PATH = join(TEST_HOME, "state.db");
+
+function writeLegacyCache(sessions: Array<Partial<CachedSession>>): void {
+  mkdirSync(join(TEST_HOME, "desktop"), { recursive: true });
+  writeFileSync(
+    CACHE_FILE,
+    // No `source` field — the shape every cache on disk has before this
+    // change shipped.
+    JSON.stringify({
+      sessions: sessions.map((s) => ({
+        id: "x",
+        title: "x",
+        startedAt: Math.floor(Date.now() / 1000),
+        source: "api_server",
+        messageCount: 1,
+        model: "gpt-5.5",
+        contextFolder: null,
+        ...s,
+      })),
+      lastSync: Math.floor(Date.now() / 1000),
+    }),
+    "utf-8",
+  );
+}
+
+describe("session cache provenance", () => {
+  it("keeps real desk- and api- prefixed sessions on the fast path", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      { id: DESK_ID, started_at: now, message_count: 2, title: "Desktop chat" },
+      { id: API_ID, started_at: now - 10, message_count: 3, title: "API chat" },
+    ]);
+    syncSessionCache();
+
+    // The DB-free read the sidebar paints from on launch.
+    expect(listCachedSessions(20).map((s) => s.id)).toEqual([DESK_ID, API_ID]);
+  });
+
+  it("still paints cached history on a startup where the DB cannot be opened", () => {
+    // "Offline startup": state.db is present but unreadable, so no sync can
+    // run. The user's history must still render — invalidation keys on the
+    // database being *gone*, not on a sync failing.
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      { id: DESK_ID, started_at: now, message_count: 2, title: "Desktop chat" },
+    ]);
+    syncSessionCache();
+    closeDbConnection();
+
+    writeFileSync(DB_PATH, "CORRUPT", "utf-8");
+
+    expect(syncSessionCache().map((s) => s.id)).toEqual([DESK_ID]);
+    expect(listCachedSessions(20).map((s) => s.id)).toEqual([DESK_ID]);
+  });
+
+  it("drops the cache once state.db no longer exists", () => {
+    // The case that never self-heals without provenance: with no database
+    // there is also no sync able to rebuild the visible set, so the rows
+    // survive every restart and reappear in the sidebar on each launch.
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      { id: DESK_ID, started_at: now, message_count: 2, title: "Old session" },
+    ]);
+    syncSessionCache();
+    expect(listCachedSessions(20)).toHaveLength(1);
+
+    closeDbConnection();
+    unlinkSync(DB_PATH);
+
+    expect(listCachedSessions(20)).toEqual([]);
+    expect(syncSessionCache()).toEqual([]);
+  });
+
+  it("drops the cache when state.db has been replaced by a different database", () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      { id: DESK_ID, started_at: now, message_count: 2, title: "Old session" },
+    ]);
+    syncSessionCache();
+    expect(JSON.parse(readFileSync(CACHE_FILE, "utf-8")).source).toBeTruthy();
+
+    // Reinstall / profile reset / restored backup: same path, different file.
+    closeDbConnection();
+    unlinkSync(DB_PATH);
+    seedDb([
+      {
+        id: "desk-1789288999999-11111111-2222-3333-4444-555555555555",
+        started_at: now - 86400 * 30,
+        message_count: 4,
+        title: "New install session",
+      },
+    ]);
+
+    expect(listCachedSessions(20)).toEqual([]);
+    expect(syncSessionCache().map((s) => s.title)).toEqual([
+      "New install session",
+    ]);
+  });
+
+  it("waits for authoritative sync before painting a pre-provenance cache", () => {
+    // Upgrade preserves the file, but only successful DB reads can establish
+    // which history belongs to the current profile/database.
+    const now = Math.floor(Date.now() / 1000);
+    seedDb([
+      {
+        id: DESK_ID,
+        started_at: now - 86400 * 30,
+        message_count: 2,
+        title: "Real",
+      },
+    ]);
+    writeLegacyCache([
+      { id: "ghost-session", title: "Ghost" },
+      { id: DESK_ID, title: "Real" },
+    ]);
+
+    expect(listCachedSessions(20)).toEqual([]);
+
+    expect(syncSessionCache().map((s) => s.id)).toEqual([DESK_ID]);
+    expect(listCachedSessions(20).map((s) => s.id)).toEqual([DESK_ID]);
+  });
+
+  it("rejects unstamped legacy rows when the existing database cannot be opened", () => {
+    mkdirSync(TEST_HOME, { recursive: true });
+    writeFileSync(DB_PATH, "CORRUPT", "utf-8");
+    writeLegacyCache([{ id: DESK_ID, title: "PONG" }]);
+    expect(listCachedSessions(20)).toEqual([]);
+    expect(syncSessionCache()).toEqual([]);
+    expect(
+      JSON.parse(readFileSync(CACHE_FILE, "utf-8")).source,
+    ).toBeUndefined();
+  });
+
+  it("validates each profile's cache against its own database", () => {
+    // Provenance is resolved per profile, so a named profile whose state.db
+    // is gone must not be rescued by the default profile's live database.
+    const now = Math.floor(Date.now() / 1000);
+    seedDb(
+      [{ id: DESK_ID, started_at: now, message_count: 1, title: "Work chat" }],
+      "work",
+    );
+    syncSessionCache("work");
+    expect(listCachedSessions(20, 0, "work")).toHaveLength(1);
+
+    seedDb([{ id: API_ID, started_at: now, message_count: 1, title: "Mine" }]);
+    syncSessionCache();
+
+    closeDbConnection();
+    unlinkSync(join(TEST_HOME, "profiles", "work", "state.db"));
+
+    expect(listCachedSessions(20, 0, "work")).toEqual([]);
+    expect(listCachedSessions(20).map((s) => s.id)).toEqual([API_ID]);
+  });
 });

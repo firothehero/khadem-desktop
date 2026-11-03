@@ -1,4 +1,5 @@
 export default {
+  showEarlierMessages: "以前のメッセージを{{count}}件表示",
   title: "新規チャット",
   sessionTitle: "セッション {{id}}",
   noModel: "モデル未設定",
@@ -8,6 +9,7 @@ export default {
   quickAskTitle: "Quick Ask (/btw) — 会話コンテキストに影響しないサイド質問",
   send: "送信",
   custom: "カスタム",
+  searchModels: "モデルを検索...",
   typeModelName: "モデル名を入力...",
   emptyTitle: "今日はどんなお手伝いを？",
   emptyHint: "コード生成、質問への回答、Web 検索など何でも頼んでください",
@@ -21,11 +23,16 @@ export default {
   deny: "拒否",
   newChat: "新規チャット (Cmd+N)",
   clearChat: "チャットをクリア",
+  setContextFolder: "コンテキストフォルダを設定",
+  contextFolderActive: "コンテキストフォルダ: {{path}}",
+  removeContextFolder: "コンテキストフォルダを削除",
   attach: "ファイルを添付",
   removeAttachment: "添付を削除",
   dropToAttach: "ファイルをドロップして添付",
   attachUnsupported: "{{name}}: 対応していないファイル形式です",
-  attachImageTooLarge: "{{name}}: 画像が大きすぎます（最大 20 MB）",
+  attachImageTooLarge: "{{name}}: 画像が大きすぎます（最大 50 MB）",
+  attachImageUncompressible:
+    "{{name}}: サイズに収まるよう画像を圧縮できませんでした（アニメーション GIF または非対応フォーマット）。静止画のスクリーンショットをお試しください。",
   attachTextTooLarge: "{{name}}: ファイルが大きすぎます（最大 256 KB）",
   attachTooMany: "添付が多すぎます（1 メッセージにつき最大 10 件）",
   attachReadFailed: "{{name}}: 読み込めませんでした",
@@ -44,6 +51,11 @@ export default {
   categoryInfo: "情報",
   noUsageData:
     "まだ使用データがありません。まずメッセージを送ってみてください。",
+  media: {
+    open: "開く",
+    saveAs: "名前を付けて保存…",
+    saveImage: "画像を保存",
+  },
   commands: {
     new: "新しいチャットを開始",
     clear: "会話履歴をクリア",
@@ -68,5 +80,15 @@ export default {
     memory: "エージェントメモリを表示",
     persona: "現在のペルソナを表示",
     version: "Hermes バージョンを表示",
+  },
+  queuedCancel: "キューから削除",
+  copyMessage: "メッセージをコピー",
+  worktree: {
+    loading: "読み込み中",
+    empty: "フォルダは空です",
+    emptyFolder: "空のフォルダ",
+    errorLoading: "フォルダの読み込みに失敗しました",
+    openTerminal: "ここでターミナルを開く",
+    openTerminalFailed: "このフォルダーのターミナルを開けませんでした。",
   },
 } as const;

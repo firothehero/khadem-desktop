@@ -1,12 +1,28 @@
 import Database from "better-sqlite3";
-import { join } from "path";
-import { existsSync } from "fs";
-import { HERMES_HOME } from "./installer";
 import type { Attachment } from "../shared/attachments";
 import { isImageMime } from "../shared/attachments";
+import { clearStagedAttachments } from "./attachment-staging";
 import { removeSessionFromCache } from "./session-cache";
-
-const DB_PATH = join(HERMES_HOME, "state.db");
+import {
+  getDbConnection,
+  conversationListPredicate,
+  preserveHiddenSessionChildren,
+} from "./db";
+import {
+  attachmentFromLocalVisionImagePath,
+  deletePromptImageAttachmentsForSession,
+  extractLeadingVisionImageFallback,
+  loadPromptImageAttachments,
+  stripTrailingImagePlaceholders,
+} from "./session-attachment-store";
+import {
+  deleteSessionContinuationForSession,
+  loadSessionContinuationItems,
+  loadSessionLocalErrors,
+  mergeSessionLocalErrors,
+} from "./session-continuation-store";
+import { deleteSessionContextFolderForSession } from "./session-context-folder-store";
+import { deleteSessionModelOverrideForSession } from "./session-model-override-store";
 
 // Sentinel prefix used by hermes-agent's hermes_state.py to mark
 // JSON-encoded multimodal content in the messages.content column.
@@ -31,6 +47,57 @@ export interface SessionMessage {
   timestamp: number;
   attachments?: Attachment[];
 }
+
+/**
+ * Renderer-facing union of timeline items reconstructed from the DB.
+ *
+ * `user` / `assistant` are visible message bubbles. `reasoning`,
+ * `tool_call`, and `tool_result` are surfaced as collapsible sub-rows
+ * — they exist in the agent's state DB but were dropped on read until
+ * this change. We emit them inline at the position they originally
+ * occurred so the resumed transcript matches the live conversation.
+ */
+export type HistoryItem =
+  | {
+      kind: "user";
+      id: number;
+      content: string;
+      timestamp: number;
+      attachments?: Attachment[];
+    }
+  | {
+      kind: "assistant";
+      id: number;
+      content: string;
+      timestamp: number;
+      error?: string;
+      attachments?: Attachment[];
+    }
+  | {
+      kind: "reasoning";
+      id: number;
+      assistantId: number;
+      text: string;
+      timestamp: number;
+    }
+  | {
+      kind: "tool_call";
+      id: number;
+      assistantId: number;
+      callId: string;
+      name: string;
+      args: string; // pretty-printed JSON when possible, otherwise raw
+      timestamp: number;
+    }
+  | {
+      kind: "tool_result";
+      id: number;
+      callId: string;
+      name: string;
+      content: string;
+      timestamp: number;
+      attachments?: Attachment[];
+    };
 
 interface DecodedContent {
   text: string;
@@ -121,61 +188,185 @@ export interface SearchResult {
   snippet: string;
 }
 
-function getDb(readonly = true): Database.Database | null {
-  if (!existsSync(DB_PATH)) return null;
-  return new Database(DB_PATH, readonly ? { readonly: true } : {});
+export function dedupeSearchRowsBySession<T extends { session_id: string }>(
+  rows: T[],
+  limit: number,
+): T[] {
+  const uniqueRows: T[] = [];
+  const seenSessionIds = new Set<string>();
+  for (const row of rows) {
+    if (seenSessionIds.has(row.session_id)) continue;
+    seenSessionIds.add(row.session_id);
+    uniqueRows.push(row);
+    if (uniqueRows.length >= limit) break;
+  }
+  return uniqueRows;
 }
 
-export function listSessions(limit = 30, offset = 0): SessionSummary[] {
-  const db = getDb();
+function escapeLikePattern(query: string): string {
+  return query.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+function highlightTextMatch(text: string, query: string): string {
+  if (!text) return "";
+
+  const terms = [query.trim(), ...query.trim().split(/\s+/)]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  for (const term of terms) {
+    const index = text.toLocaleLowerCase().indexOf(term.toLocaleLowerCase());
+    if (index >= 0) {
+      return `${text.slice(0, index)}<<${text.slice(
+        index,
+        index + term.length,
+      )}>>${text.slice(index + term.length)}`;
+    }
+  }
+
+  return text;
+}
+
+function fallbackSessionTitle(sessionId: string): string {
+  return `Sessions ${sessionId.slice(-6)}`;
+}
+
+function highlightSessionMatch(
+  title: string | null,
+  sessionId: string,
+  query: string,
+): string {
+  const text = title || "";
+  const highlightedTitle = highlightTextMatch(text, query);
+  if (highlightedTitle && highlightedTitle.includes("<<")) {
+    return highlightedTitle;
+  }
+
+  return highlightTextMatch(fallbackSessionTitle(sessionId), query);
+}
+
+function decodeSearchSnippet(
+  raw: string | null,
+  messageId: number,
+  query: string,
+): string {
+  const decoded = decodeContent(raw || "", messageId).text;
+  const visible = stripTrailingImagePlaceholders(
+    extractLeadingVisionImageFallback(decoded).content,
+  );
+  return highlightTextMatch(visible || decoded || raw || "", query).slice(
+    0,
+    500,
+  );
+}
+
+function getDb(readonly = true, profile?: unknown): Database.Database | null {
+  return getDbConnection(readonly, profile);
+}
+
+/**
+ * Rows for a human-facing conversation list, newest first. Exported so the
+ * listing rule can be tested against a real database rather than mocked.
+ */
+export function listConversationRows(
+  db: Database.Database,
+  limit: number,
+  offset: number,
+): SessionSummary[] {
+  // Titles come from the session cache, not a correlated subquery.
+  const rows = db
+    .prepare(
+      `SELECT
+        s.id,
+        s.source,
+        s.started_at,
+        s.ended_at,
+        s.message_count,
+        s.model,
+        s.title
+      FROM sessions s
+      WHERE ${conversationListPredicate(db)}
+      ORDER BY s.started_at DESC
+      LIMIT ? OFFSET ?`,
+    )
+    .all(limit, offset) as Array<{
+    id: string;
+    source: string;
+    started_at: number;
+    ended_at: number | null;
+    message_count: number;
+    model: string;
+    title: string | null;
+  }>;
+
+  return rows.map((r) => ({
+    id: r.id,
+    source: r.source,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    messageCount: r.message_count,
+    model: r.model || "",
+    title: r.title,
+    preview: "",
+  }));
+}
+
+export function listSessions(
+  limit = 30,
+  offset = 0,
+  profile?: unknown,
+): SessionSummary[] {
+  const db = getDb(true, profile);
+  if (!db) return [];
+
+  return listConversationRows(db, limit, offset);
+}
+
+export function searchSessions(
+  query: string,
+  limit = 20,
+  profile?: unknown,
+): SearchResult[] {
+  const db = getDb(true, profile);
   if (!db) return [];
 
   try {
-    // Simple query without correlated subquery — titles come from session cache
-    const rows = db
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return [];
+
+    const titleRows = db
       .prepare(
         `SELECT
-          s.id,
-          s.source,
+          s.id as session_id,
+          s.title,
           s.started_at,
-          s.ended_at,
+          s.source,
           s.message_count,
-          s.model,
-          s.title
+          s.model
         FROM sessions s
+        WHERE LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'
+          OR LOWER(s.id) LIKE ? ESCAPE '\\'
         ORDER BY s.started_at DESC
-        LIMIT ? OFFSET ?`,
+        LIMIT ?`,
       )
-      .all(limit, offset) as Array<{
-      id: string;
-      source: string;
+      .all(
+        `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
+        `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
+        limit,
+      ) as Array<{
+      session_id: string;
+      title: string | null;
       started_at: number;
-      ended_at: number | null;
+      source: string;
       message_count: number;
       model: string;
-      title: string | null;
     }>;
 
-    return rows.map((r) => ({
-      id: r.id,
-      source: r.source,
-      startedAt: r.started_at,
-      endedAt: r.ended_at,
-      messageCount: r.message_count,
-      model: r.model || "",
-      title: r.title,
-      preview: "",
+    const titleMatches = titleRows.map((r) => ({
+      ...r,
+      snippet: highlightSessionMatch(r.title, r.session_id, trimmedQuery),
     }));
-  } finally {
-    db.close();
-  }
-}
 
-export function searchSessions(query: string, limit = 20): SearchResult[] {
-  const db = getDb();
-  if (!db) return [];
-
-  try {
     // Check if FTS table exists
     const tableCheck = db
       .prepare(
@@ -183,46 +374,89 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
       )
       .get() as { name: string } | undefined;
 
-    if (!tableCheck) return [];
-
     // Sanitize query for FTS5: wrap each word with quotes for safety, add * for prefix
-    const sanitized = query
+    const sanitized = trimmedQuery
       .trim()
       .split(/\s+/)
       .filter((w) => w.length > 0)
       .map((w) => `"${w.replace(/"/g, "")}"*`)
       .join(" ");
 
-    if (!sanitized) return [];
+    const ftsRows = tableCheck
+      ? (db
+          .prepare(
+            `SELECT DISTINCT
+              m.session_id,
+              s.title,
+              s.started_at,
+              s.source,
+              s.message_count,
+              s.model,
+              snippet(messages_fts, 0, '<<', '>>', '...', 40) as snippet
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE messages_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?`,
+          )
+          .all(sanitized, Math.max(limit * 5, limit)) as Array<{
+          session_id: string;
+          title: string | null;
+          started_at: number;
+          source: string;
+          message_count: number;
+          model: string;
+          snippet: string;
+        }>)
+      : [];
 
-    const rows = db
+    const messageRows = db
       .prepare(
-        `SELECT DISTINCT
+        `SELECT
+          m.id as message_id,
+          m.content,
           m.session_id,
           s.title,
           s.started_at,
           s.source,
           s.message_count,
-          s.model,
-          snippet(messages_fts, 0, '<<', '>>', '...', 40) as snippet
-        FROM messages_fts
-        JOIN messages m ON m.id = messages_fts.rowid
+          s.model
+        FROM messages m
         JOIN sessions s ON s.id = m.session_id
-        WHERE messages_fts MATCH ?
-        ORDER BY rank
+        WHERE LOWER(COALESCE(m.content, '')) LIKE ? ESCAPE '\\'
+        ORDER BY s.started_at DESC, m.timestamp ASC, m.id ASC
         LIMIT ?`,
       )
-      .all(sanitized, limit) as Array<{
+      .all(
+        `%${escapeLikePattern(trimmedQuery.toLocaleLowerCase())}%`,
+        Math.max(limit * 8, 50),
+      ) as Array<{
+      message_id: number;
+      content: string | null;
       session_id: string;
       title: string | null;
       started_at: number;
       source: string;
       message_count: number;
       model: string;
-      snippet: string;
     }>;
 
-    return rows.map((r) => ({
+    const messageMatches = messageRows.map((r) => ({
+      session_id: r.session_id,
+      title: r.title,
+      started_at: r.started_at,
+      source: r.source,
+      message_count: r.message_count,
+      model: r.model,
+      snippet: decodeSearchSnippet(r.content, r.message_id, trimmedQuery),
+    }));
+
+    const uniqueRows = dedupeSearchRowsBySession(
+      [...titleMatches, ...ftsRows, ...messageMatches],
+      limit,
+    );
+    return uniqueRows.map((r) => ({
       sessionId: r.session_id,
       title: r.title,
       startedAt: r.started_at,
@@ -233,60 +467,375 @@ export function searchSessions(query: string, limit = 20): SearchResult[] {
     }));
   } catch {
     return [];
-  } finally {
-    db.close();
   }
 }
 
-export function getSessionMessages(sessionId: string): SessionMessage[] {
-  const db = getDb();
-  if (!db) return [];
-
+/**
+ * Try hard to extract human-readable reasoning text from one of the three
+ * provider-specific columns the agent stores it in. Returns "" when nothing
+ * usable is present.
+ *
+ * Priority: `reasoning` (plain text from most providers) >
+ *           `reasoning_content` (legacy mirror) >
+ *           `reasoning_details` (Anthropic / OpenRouter signed-block JSON;
+ *            we flatten its `text` fields when present, otherwise drop it).
+ */
+export function pickReasoning(row: {
+  reasoning: string | null;
+  reasoning_content: string | null;
+  reasoning_details: string | null;
+}): string {
+  const direct = (row.reasoning || "").trim();
+  if (direct) return direct;
+  const legacy = (row.reasoning_content || "").trim();
+  if (legacy) return legacy;
+  const details = (row.reasoning_details || "").trim();
+  if (!details) return "";
   try {
-    const rows = db
-      .prepare(
-        `SELECT id, role, content, timestamp
-         FROM messages
-         WHERE session_id = ? AND role IN ('user', 'assistant') AND content IS NOT NULL
-         ORDER BY timestamp, id`,
-      )
-      .all(sessionId) as Array<{
-      id: number;
-      role: string;
-      content: string;
-      timestamp: number;
-    }>;
+    const parsed = JSON.parse(details);
+    if (typeof parsed === "string") return parsed;
+    if (Array.isArray(parsed)) {
+      const texts: string[] = [];
+      for (const entry of parsed) {
+        if (!entry || typeof entry !== "object") continue;
+        const e = entry as Record<string, unknown>;
+        if (typeof e.text === "string" && e.text) texts.push(e.text);
+        else if (typeof e.thinking === "string" && e.thinking)
+          texts.push(e.thinking);
+      }
+      if (texts.length) return texts.join("\n\n");
+    }
+  } catch {
+    /* fall through */
+  }
+  return "";
+}
 
-    return rows.map((r) => {
-      const decoded = decodeContent(r.content, r.id);
-      return {
+/**
+ * Parse the assistant row's `tool_calls` JSON. Each entry from the agent
+ * looks like `{id, call_id, type:"function", function:{name, arguments}}`.
+ * `arguments` is itself a JSON-encoded string the agent sent to the model.
+ * We pretty-print it for display when it parses, leave it raw otherwise.
+ *
+ * Returns `[]` on any parse failure — the caller silently skips bad rows
+ * so a malformed tool_calls cell never blocks history rendering.
+ */
+export function parseToolCalls(
+  raw: string | null,
+): Array<{ callId: string; name: string; args: string }> {
+  if (!raw || !raw.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: Array<{ callId: string; name: string; args: string }> = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const fn = (e.function || {}) as Record<string, unknown>;
+    const name = typeof fn.name === "string" ? fn.name : "";
+    if (!name) continue;
+    const callId =
+      (typeof e.call_id === "string" && e.call_id) ||
+      (typeof e.id === "string" && e.id) ||
+      "";
+    const rawArgs = typeof fn.arguments === "string" ? fn.arguments : "";
+    let args = rawArgs;
+    try {
+      args = JSON.stringify(JSON.parse(rawArgs), null, 2);
+    } catch {
+      // arguments wasn't JSON — leave as-is
+    }
+    out.push({ callId, name, args });
+  }
+  return out;
+}
+
+/**
+ * Row shape as returned by the widened SELECT inside getSessionMessages,
+ * exported so the unit tests can build fixture rows without going through
+ * sqlite (better-sqlite3 is an Electron-only native module).
+ */
+export interface RawMessageRow {
+  id: number;
+  role: string;
+  content: string | null;
+  timestamp: number;
+  tool_call_id: string | null;
+  tool_calls: string | null;
+  tool_name: string | null;
+  reasoning: string | null;
+  reasoning_content: string | null;
+  reasoning_details: string | null;
+}
+
+/**
+ * Pure expansion of DB rows → renderer-facing HistoryItem list. Kept pure
+ * (no I/O) so we can exercise the ordering and edge-case logic directly
+ * without booting sqlite.
+ */
+export function expandRowsToHistory(rows: RawMessageRow[]): HistoryItem[] {
+  const items: HistoryItem[] = [];
+  for (const r of rows) {
+    const decoded = decodeContent(r.content || "", r.id);
+
+    if (r.role === "user") {
+      if (!decoded.text && decoded.attachments.length === 0) continue;
+      items.push({
+        kind: "user",
         id: r.id,
-        role: r.role as "user" | "assistant",
         content: decoded.text,
         timestamp: r.timestamp,
         ...(decoded.attachments.length > 0
           ? { attachments: decoded.attachments }
           : {}),
-      };
-    });
-  } finally {
-    db.close();
+      });
+      continue;
+    }
+
+    if (r.role === "assistant") {
+      const reasoningText = pickReasoning(r);
+      if (reasoningText) {
+        items.push({
+          kind: "reasoning",
+          id: r.id,
+          assistantId: r.id,
+          text: reasoningText,
+          timestamp: r.timestamp,
+        });
+      }
+
+      if (decoded.text || decoded.attachments.length > 0) {
+        items.push({
+          kind: "assistant",
+          id: r.id,
+          content: decoded.text,
+          timestamp: r.timestamp,
+          ...(decoded.attachments.length > 0
+            ? { attachments: decoded.attachments }
+            : {}),
+        });
+      }
+
+      for (const tc of parseToolCalls(r.tool_calls)) {
+        items.push({
+          kind: "tool_call",
+          id: r.id,
+          assistantId: r.id,
+          callId: tc.callId,
+          name: tc.name,
+          args: tc.args,
+          timestamp: r.timestamp,
+        });
+      }
+      continue;
+    }
+
+    if (r.role === "tool") {
+      const name = r.tool_name || "tool";
+      items.push({
+        kind: "tool_result",
+        id: r.id,
+        callId: r.tool_call_id || "",
+        name,
+        content: decoded.text,
+        timestamp: r.timestamp,
+        ...(decoded.attachments.length > 0
+          ? { attachments: decoded.attachments }
+          : {}),
+      });
+      continue;
+    }
+  }
+  return items;
+}
+
+export function mergeStoredPromptImageAttachments(
+  items: HistoryItem[],
+  attachmentsByMessageId: Map<number, Attachment[]>,
+): HistoryItem[] {
+  return items.map((item) => {
+    if (item.kind !== "user") return item;
+    const fallback = extractLeadingVisionImageFallback(item.content);
+    const stored = attachmentsByMessageId.get(item.id);
+    const fallbackAttachment = attachmentFromLocalVisionImagePath(
+      fallback.imagePath,
+      `db-fallback-att-${item.id}-0`,
+    );
+    const nextContent = stripTrailingImagePlaceholders(fallback.content);
+    const nextAttachments =
+      item.attachments && item.attachments.length > 0
+        ? item.attachments
+        : stored && stored.length > 0
+          ? stored
+          : fallbackAttachment
+            ? [fallbackAttachment]
+            : undefined;
+
+    if (
+      nextContent === item.content &&
+      (!nextAttachments || nextAttachments === item.attachments)
+    ) {
+      return item;
+    }
+
+    return {
+      ...item,
+      content: nextContent,
+      ...(nextAttachments && nextAttachments.length > 0
+        ? { attachments: nextAttachments }
+        : {}),
+    };
+  });
+}
+
+export function getSessionMessages(
+  sessionId: string,
+  profile?: unknown,
+): HistoryItem[] {
+  const db = getDb(true, profile);
+  if (!db) return [];
+
+  const rows = db
+    .prepare(
+      `SELECT id, role, content, timestamp,
+              tool_call_id, tool_calls, tool_name,
+              reasoning, reasoning_content, reasoning_details
+       FROM messages
+       WHERE session_id = ? AND role IN ('user', 'assistant', 'tool')
+       ORDER BY timestamp, id`,
+    )
+    .all(sessionId) as RawMessageRow[];
+
+  const items = expandRowsToHistory(rows);
+  const canonical = mergeStoredPromptImageAttachments(
+    items,
+    loadPromptImageAttachments(db, sessionId),
+  );
+  return applySessionLocalOverlays(sessionId, canonical, db);
+}
+
+export function applySessionLocalOverlays(
+  sessionId: string,
+  items: HistoryItem[],
+  existingDb?: Database.Database | null,
+  profile?: unknown,
+): HistoryItem[] {
+  const db = existingDb ?? getDb(true, profile);
+  if (!db) return items;
+  const canonical = mergeStoredPromptImageAttachments(
+    items,
+    loadPromptImageAttachments(db, sessionId),
+  );
+  const withLocalErrors = mergeSessionLocalErrors(
+    canonical,
+    loadSessionLocalErrors(db, sessionId),
+  );
+  return [...loadSessionContinuationItems(db, sessionId), ...withLocalErrors];
+}
+
+export interface DeleteSessionsResult {
+  requested: number;
+  deleted: number;
+}
+
+function normalizeSessionIds(sessionIds: string[]): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const id of sessionIds) {
+    if (typeof id !== "string") continue;
+    const trimmed = id.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+// sessions has a self-referential FK parent_session_id -> sessions.id (set by
+// the agent for subagent runs / branches). Each profile can have a different schema.
+function hasParentSessionColumn(db: Database.Database): boolean {
+  try {
+    return (
+      db
+        .prepare(
+          "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'",
+        )
+        .get() != null
+    );
+  } catch {
+    return false;
   }
 }
 
-export function deleteSession(sessionId: string): void {
-  const db = getDb(false);
-  if (!db) return;
+function deleteSessionRows(db: Database.Database, sessionId: string): number {
+  deletePromptImageAttachmentsForSession(db, sessionId);
+  deleteSessionContinuationForSession(db, sessionId);
+  // Unlink any child sessions first. better-sqlite3 enables
+  // PRAGMA foreign_keys=ON by default, so deleting a parent while a child
+  // still references it via parent_session_id throws "FOREIGN KEY constraint
+  // failed", which rolls back the whole delete transaction -> 0 rows deleted
+  // with no surfaced error (and a select-all batch deletes nothing, since one
+  // violation aborts the entire transaction). Detach children rather than
+  // cascade-delete so a session the user didn't select is never removed.
+  if (hasParentSessionColumn(db)) {
+    preserveHiddenSessionChildren(db, sessionId);
+    db.prepare(
+      "UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?",
+    ).run(sessionId);
+  }
+  deleteSessionContextFolderForSession(db, sessionId);
+  deleteSessionModelOverrideForSession(db, sessionId);
+  db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+  const result = db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+  return result.changes;
+}
 
-  try {
-    const tx = db.transaction((id: string) => {
-      db.prepare("DELETE FROM messages WHERE session_id = ?").run(id);
-      db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+function cleanupDeletedSession(sessionId: string, profile?: unknown): void {
+  clearStagedAttachments(sessionId);
+  removeSessionFromCache(sessionId, profile);
+}
+
+export function deleteSession(sessionId: string, profile?: unknown): void {
+  const id = normalizeSessionIds([sessionId])[0];
+  if (!id) return;
+
+  const db = getDb(false, profile);
+
+  if (db) {
+    const tx = db.transaction((sessionIdToDelete: string) => {
+      deleteSessionRows(db, sessionIdToDelete);
     });
-    tx(sessionId);
-  } finally {
-    db.close();
+    tx(id);
   }
 
-  removeSessionFromCache(sessionId);
+  cleanupDeletedSession(id, profile);
+}
+
+export function deleteSessions(
+  sessionIds: string[],
+  profile?: unknown,
+): DeleteSessionsResult {
+  const ids = normalizeSessionIds(sessionIds);
+  let deleted = 0;
+
+  const db = getDb(false, profile);
+
+  if (db) {
+    const tx = db.transaction((idsToDelete: string[]) => {
+      for (const id of idsToDelete) {
+        deleted += deleteSessionRows(db, id);
+      }
+    });
+    tx(ids);
+  }
+
+  for (const id of ids) {
+    cleanupDeletedSession(id, profile);
+  }
+
+  return { requested: ids.length, deleted };
 }

@@ -3,13 +3,60 @@ export default {
   sections: {
     hermesAgent: "Agente Hermes",
     appearance: "Aparência",
+    privacy: "Privacidade",
     credentialPool: "Pool de Credenciais",
+  },
+  nav: {
+    groups: {
+      general: "Geral",
+      hermes: "Hermes One",
+    },
+    appearance: "Aparência",
+    language: "Idioma",
+    pets: "Mascotes",
+    privacy: "Privacidade",
+    connection: "Ligação",
+    network: "Rede",
+    data: "Dados",
+    about: "Acerca e atualizações",
+    community: "Comunidade",
+    logs: "Registos e diagnóstico",
+  },
+  analytics: {
+    label: "Enviar análises de utilização anónimas",
+    hint: "Ajuda a melhorar o Hermes ao enviar dados de utilização anónimos e agregados para o serviço de análise do projecto. Pode desactivar a qualquer momento.",
+    disclosure: {
+      uuid: "Um identificador aleatório por instalação guardado apenas neste dispositivo (sem nome, e-mail ou dados de conta).",
+      platform:
+        "O seu sistema operativo, versão do Electron e versão do Node.js.",
+      navigation:
+        "Que ecrãs abre dentro da aplicação (ex.: Conversa, Sessões, Definições). Não é recolhido conteúdo de conversas, prompts, respostas do modelo nem conteúdo de ficheiros.",
+      endpoint:
+        "Os dados são enviados para o serviço de análise do Hermes (analytics.hermesone.org). As gravações de sessão e a captura automática de páginas visitadas estão desactivadas.",
+      notCollected:
+        "Nunca é recolhido: mensagens de conversa, caminhos de ficheiros, chaves de API, configuração do modelo, credenciais de conta.",
+    },
   },
   theme: {
     label: "Tema",
     system: "Sistema",
     light: "Claro",
     dark: "Escuro",
+  },
+  pet: {
+    label: "Mascotes",
+    hint: "Partilhadas com o Hermes Agent e a aplicação oficial neste perfil. Escolha uma mascote para a instalar e ativar.",
+    loading: "A carregar mascotes…",
+    enabled: "Mostrar mascote",
+    scale: "Tamanho",
+    search: "Pesquisar mascotes",
+    active: "Ativa",
+    installed: "Instalada",
+    adopt: "Adotar",
+    rename: "Renomear",
+    export: "Exportar",
+    remove: "Remover",
+    confirmRemove: "Remover {{name}} deste perfil?",
   },
   language: {
     label: "Idioma",

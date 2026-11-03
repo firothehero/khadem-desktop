@@ -1,5 +1,5 @@
 export default {
-  appName: "Hermes Agent",
+  appName: "Hermes One",
   continue: "続ける",
   cancel: "キャンセル",
   retry: "再試行",
@@ -40,6 +40,8 @@ export default {
   devOnly: "開発者向け",
   updateAvailable: "アップデート v{{version}}",
   downloading: "ダウンロード中 {{percent}}%",
+  downloadingUnknown: "ダウンロード中...",
+  waitingForDownloadProgress: "ダウンロードの進行状況を待っています...",
   restartToUpdate: "再起動してアップデート",
   errorTitle: "エラーが発生しました",
   errorMessage: "予期しないエラーが発生しました。",

@@ -2,30 +2,57 @@ import {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useCallback,
   forwardRef,
   useImperativeHandle,
 } from "react";
-import { Send, Square as Stop, Slash, Paperclip } from "lucide-react";
+import { Square as Stop, Search, Paperclip, Mic, ArrowUp } from "lucide-react";
+import { BorderBeam } from "border-beam";
 import { isImeComposing } from "./keyboard";
 import { useI18n } from "../../components/useI18n";
+import { useChatPreferences } from "../../components/ChatPreferencesProvider";
+import { useTheme } from "../../components/ThemeProvider";
+import { THEMES } from "../../constants";
 import { SLASH_COMMANDS, type SlashCommand } from "./slashCommands";
+import { SlashCommandIcon } from "./slash/SlashCommandIcon";
+import {
+  createSlashCommandVirtualLayout,
+  getSlashCommandScrollTop,
+  getVisibleSlashCommandRows,
+  SLASH_COMMAND_VIEWPORT_HEIGHT,
+} from "./slash/virtualSlashCommands";
 import { useInputHistory } from "./hooks/useInputHistory";
+import { useVoiceInput } from "./hooks/useVoiceInput";
 import {
   processFiles,
   filesFromClipboard,
   type AttachmentError,
 } from "./attachmentUtils";
 import { AttachmentChip } from "../../components/AttachmentChip";
+import { ContextGauge, type ContextUsage } from "./ContextGauge";
 import type { Attachment } from "../../../../shared/attachments";
+
+const THEME_APPEARANCE = new Map(
+  THEMES.map((theme) => [theme.id, theme.appearance]),
+);
 
 export interface ChatInputHandle {
   setText(text: string): void;
+  appendText(text: string): void;
   clear(): void;
   focus(): void;
   /** Add files from external sources (drop overlay).  Returns errors. */
   addFiles(files: File[] | FileList): Promise<AttachmentError[]>;
+}
+
+export interface ChatInputReadiness {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  fixLocation?: string;
+  expectedEnvKey?: string;
 }
 
 interface ChatInputProps {
@@ -33,8 +60,21 @@ interface ChatInputProps {
   hasSession: boolean;
   sessionId?: string | null;
   remoteMode?: boolean;
-  onSubmit: (text: string, attachments: Attachment[]) => void;
-  onQuickAsk: (text: string, attachments: Attachment[]) => void;
+  /** Active profile — used to resolve the provider for voice transcription. */
+  profile?: string;
+  /** Prevent an old acknowledgement from clearing another run's composer. */
+  submissionScope?: string;
+  /** Context-window occupancy for the gauge; null until the first response. */
+  contextUsage?: ContextUsage | null;
+  /** Pre-send validation state. When `ok` is false, Send is disabled
+   * and an inline banner explains why + how to fix it. */
+  readiness?: ChatInputReadiness;
+  /** Controls rendered inline in the bottom toolbar row (model + folder
+   * pickers) so they share the composer's single bordered container. */
+  toolbarExtras?: React.ReactNode;
+  slashCommands?: SlashCommand[];
+  onSubmit: (text: string, attachments: Attachment[]) => void | Promise<void>;
+  onQuickAsk: (text: string, attachments: Attachment[]) => void | Promise<void>;
   onAbort: () => void;
 }
 
@@ -45,6 +85,12 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       hasSession,
       sessionId,
       remoteMode,
+      profile,
+      submissionScope,
+      contextUsage,
+      readiness,
+      toolbarExtras,
+      slashCommands = SLASH_COMMANDS,
       onSubmit,
       onQuickAsk,
       onAbort,
@@ -52,15 +98,66 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     ref,
   ): React.JSX.Element {
     const { t } = useI18n();
-    const [input, setInput] = useState("");
+    const { spellcheckEnabled } = useChatPreferences();
+    const { resolved: resolvedTheme } = useTheme();
+    const beamTheme = THEME_APPEARANCE.get(resolvedTheme) ?? "dark";
+    const [input, setInputState] = useState("");
+    const inputRevisionRef = useRef(0);
+    const setInput = useCallback(
+      (value: React.SetStateAction<string>): void => {
+        inputRevisionRef.current += 1;
+        setInputState(value);
+      },
+      [],
+    );
     const [slashMenuOpen, setSlashMenuOpen] = useState(false);
     const [slashFilter, setSlashFilter] = useState("");
     const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     const [attachmentError, setAttachmentError] = useState<string | null>(null);
+    const [submissionError, setSubmissionError] = useState<string | null>(null);
+    const [pendingSubmissions, setPendingSubmissions] = useState<
+      ReadonlySet<string>
+    >(new Set());
+    const pendingSubmissionsRef = useRef(new Set<string>());
+    const submissionScopeRef = useRef(submissionScope);
+    submissionScopeRef.current = submissionScope;
+    const submissionGenerationRef = useRef(0);
+    useEffect(
+      () => () => {
+        submissionGenerationRef.current += 1;
+      },
+      [],
+    );
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const slashMenuRef = useRef<HTMLDivElement>(null);
+    const slashMenuListRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const [slashMenuScrollTop, setSlashMenuScrollTop] = useState(0);
+    const [slashMenuViewportHeight, setSlashMenuViewportHeight] = useState(
+      SLASH_COMMAND_VIEWPORT_HEIGHT,
+    );
+    // Tracks an active IME composition (Korean/Japanese/Chinese). Driven by the
+    // composition events rather than the synthetic event's `isComposing` flag,
+    // which macOS Chromium can report as false on the finalizing Enter.
+    const composingRef = useRef(false);
+
+    // Voice input. We snapshot whatever was already typed when recording starts
+    // (`voiceBaseRef`), then rebuild the field as `base + livetranscript` on
+    // every result so the SpeechRecognition path streams in live. The recorder
+    // fallback delivers one final result on stop.
+    const voiceBaseRef = useRef("");
+    const handleVoiceResult = useCallback(
+      (text: string, isFinal: boolean) => {
+        const base = voiceBaseRef.current;
+        setInput(
+          base.trim() ? (text ? `${base.trimEnd()} ${text}` : base) : text,
+        );
+        if (isFinal) inputRef.current?.focus();
+      },
+      [setInput],
+    );
+    const voice = useVoiceInput(handleVoiceResult, profile);
 
     const autoResize = useCallback((): void => {
       const el = inputRef.current;
@@ -69,15 +166,28 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
     }, []);
 
+    // Resize the textarea once per committed value, in a layout effect, rather
+    // than reading `scrollHeight` inside a requestAnimationFrame on every
+    // keystroke. The synchronous scrollHeight read forces a document reflow;
+    // doing it here (post-commit, pre-paint) keeps it to a single measurement
+    // and lets `content-visibility` on off-screen rows bound its cost — this is
+    // the input-lag fix for long conversations (#748). All `setInput` paths
+    // (typing, history recall, voice, imperative setText/appendText) funnel
+    // through here, so none of them need to resize by hand.
+    // @lat: [[chat-performance#Textarea auto-resize avoids per-keystroke reflow]]
+    useLayoutEffect(() => {
+      autoResize();
+    }, [input, autoResize]);
+
     const applyHistoryText = useCallback(
       (text: string): void => {
         setInput(text);
+        // Resize runs via the layout effect; just place the caret at the end.
         requestAnimationFrame(() => {
-          autoResize();
           inputRef.current?.setSelectionRange(text.length, text.length);
         });
       },
-      [autoResize],
+      [setInput],
     );
 
     const history = useInputHistory({
@@ -92,6 +202,8 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             return t("chat.attachTooMany");
           case "image-too-large":
             return t("chat.attachImageTooLarge", { name: err.filename });
+          case "image-uncompressible":
+            return t("chat.attachImageUncompressible", { name: err.filename });
           case "text-too-large":
             return t("chat.attachTextTooLarge", { name: err.filename });
           case "unsupported-type":
@@ -135,18 +247,32 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       () => ({
         setText(text: string): void {
           setInput(text);
+          // Resize runs via the layout effect; place the caret + focus.
           requestAnimationFrame(() => {
-            autoResize();
             if (inputRef.current) {
               inputRef.current.setSelectionRange(text.length, text.length);
               inputRef.current.focus();
             }
           });
         },
+        appendText(text: string): void {
+          setInput((prev) => {
+            const next = prev ? `${prev}\n${text}` : text;
+            requestAnimationFrame(() => {
+              if (inputRef.current) {
+                inputRef.current.setSelectionRange(next.length, next.length);
+                inputRef.current.focus();
+              }
+            });
+            return next;
+          });
+        },
         clear(): void {
+          submissionGenerationRef.current += 1;
           setInput("");
           setAttachments([]);
           setAttachmentError(null);
+          setSubmissionError(null);
           if (inputRef.current) inputRef.current.style.height = "auto";
         },
         focus(): void {
@@ -156,7 +282,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
           return ingestFiles(files);
         },
       }),
-      [autoResize, ingestFiles],
+      [ingestFiles, setInput],
     );
 
     // Refocus the textarea when a streaming response ends
@@ -164,78 +290,189 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       if (!isLoading) inputRef.current?.focus();
     }, [isLoading]);
 
-    // Close slash menu on click outside
     useEffect(() => {
-      if (!slashMenuOpen) return;
-      function handleClickOutside(e: MouseEvent): void {
-        if (
-          slashMenuRef.current &&
-          !slashMenuRef.current.contains(e.target as Node)
-        ) {
-          setSlashMenuOpen(false);
-        }
-      }
-      document.addEventListener("mousedown", handleClickOutside);
-      return () =>
-        document.removeEventListener("mousedown", handleClickOutside);
+      if (!slashMenuOpen || !slashMenuListRef.current) return;
+      const list = slashMenuListRef.current;
+      const updateViewportHeight = (): void => {
+        setSlashMenuViewportHeight(
+          list.clientHeight || SLASH_COMMAND_VIEWPORT_HEIGHT,
+        );
+      };
+      updateViewportHeight();
+      if (typeof ResizeObserver === "undefined") return;
+      const observer = new ResizeObserver(updateViewportHeight);
+      observer.observe(list);
+      return () => observer.disconnect();
     }, [slashMenuOpen]);
 
-    // Scroll active slash menu item into view
     useEffect(() => {
       if (!slashMenuOpen) return;
-      const active = slashMenuRef.current?.querySelector(
-        ".slash-menu-item-active",
-      );
-      active?.scrollIntoView({ block: "nearest" });
-    }, [slashSelectedIndex, slashMenuOpen]);
+      function handleGlobalEscape(event: KeyboardEvent): void {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        setSlashMenuOpen(false);
+        inputRef.current?.focus();
+      }
+      document.addEventListener("keydown", handleGlobalEscape, true);
+      return () =>
+        document.removeEventListener("keydown", handleGlobalEscape, true);
+    }, [slashMenuOpen]);
 
-    const filteredSlashCommands = useMemo(
+    const searchableSlashCommands = useMemo(
       () =>
-        slashMenuOpen
-          ? SLASH_COMMANDS.filter((cmd) =>
-              cmd.name.toLowerCase().startsWith(slashFilter.toLowerCase()),
-            )
-          : [],
-      [slashMenuOpen, slashFilter],
+        slashCommands.map((command) => ({
+          command,
+          normalizedName: command.name.toLowerCase(),
+          normalizedDescription: command.description.toLowerCase(),
+        })),
+      [slashCommands],
     );
 
-    function clearAfterSend(text: string): void {
+    const filteredSlashCommands = useMemo(() => {
+      if (!slashMenuOpen) return [];
+      const query = slashFilter.toLowerCase();
+      return searchableSlashCommands
+        .filter(({ normalizedName, normalizedDescription }) => {
+          return (
+            normalizedName.includes(query) ||
+            normalizedDescription.includes(query.slice(1))
+          );
+        })
+        .sort((a, b) => {
+          const aStarts = a.normalizedName.startsWith(query);
+          const bStarts = b.normalizedName.startsWith(query);
+          if (aStarts !== bStarts) return aStarts ? -1 : 1;
+          return a.normalizedName.localeCompare(b.normalizedName);
+        })
+        .map(({ command }) => command);
+    }, [searchableSlashCommands, slashMenuOpen, slashFilter]);
+
+    const slashVirtualLayout = useMemo(() => {
+      return createSlashCommandVirtualLayout(filteredSlashCommands);
+    }, [filteredSlashCommands]);
+
+    const visibleSlashRows = useMemo(() => {
+      return getVisibleSlashCommandRows(
+        slashVirtualLayout,
+        slashMenuScrollTop,
+        slashMenuViewportHeight,
+      );
+    }, [slashMenuScrollTop, slashMenuViewportHeight, slashVirtualLayout]);
+
+    useLayoutEffect(() => {
+      if (!slashMenuOpen) return;
+      const list = slashMenuListRef.current;
+      const commandTop =
+        slashVirtualLayout.commandTops[slashSelectedIndex] ?? 0;
+      const nextScrollTop = getSlashCommandScrollTop(
+        commandTop,
+        slashMenuScrollTop,
+        slashMenuViewportHeight,
+      );
+      if (nextScrollTop === slashMenuScrollTop) return;
+      if (list) list.scrollTop = nextScrollTop;
+      setSlashMenuScrollTop(nextScrollTop);
+    }, [
+      slashMenuOpen,
+      slashMenuScrollTop,
+      slashMenuViewportHeight,
+      slashSelectedIndex,
+      slashVirtualLayout,
+    ]);
+
+    function slashCategoryLabel(category: SlashCommand["category"]): string {
+      switch (category) {
+        case "chat":
+          return "Chat";
+        case "info":
+          return "Pages & settings";
+        case "tools":
+          return "Tools & skills";
+        case "agent":
+          return "Hermes Agent";
+      }
+    }
+
+    function clearAfterSend(
+      text: string,
+      draft: string,
+      sentAttachments: Attachment[],
+      draftRevision: number,
+    ): void {
       history.push(text);
-      setInput("");
-      setAttachments([]);
+      if (inputRevisionRef.current === draftRevision)
+        setInput((current) => (current === draft ? "" : current));
+      const sentIds = new Set(
+        sentAttachments.map((attachment) => attachment.id),
+      );
+      setAttachments((current) =>
+        current.filter((attachment) => !sentIds.has(attachment.id)),
+      );
       setAttachmentError(null);
-      if (inputRef.current) inputRef.current.style.height = "auto";
+    }
+
+    // @lat: [[chat-input#Submission acknowledgement]]
+    async function submit(
+      text: string,
+      sendAttachments: Attachment[],
+      callback: ChatInputProps["onSubmit"],
+      draft = input,
+    ): Promise<void> {
+      const scope = submissionScopeRef.current;
+      const generation = submissionGenerationRef.current;
+      const draftRevision = inputRevisionRef.current;
+      const key = JSON.stringify([
+        scope,
+        generation,
+        draft,
+        sendAttachments.map((attachment) => attachment.id),
+      ]);
+      if (pendingSubmissionsRef.current.has(key)) return;
+      pendingSubmissionsRef.current.add(key);
+      setPendingSubmissions(new Set(pendingSubmissionsRef.current));
+      setSubmissionError(null);
+      try {
+        await callback(text, sendAttachments);
+        if (
+          submissionScopeRef.current === scope &&
+          submissionGenerationRef.current === generation
+        )
+          clearAfterSend(text, draft, sendAttachments, draftRevision);
+      } catch (error) {
+        if (
+          submissionScopeRef.current === scope &&
+          submissionGenerationRef.current === generation
+        )
+          setSubmissionError(
+            error instanceof Error ? error.message : String(error),
+          );
+      } finally {
+        pendingSubmissionsRef.current.delete(key);
+        setPendingSubmissions(new Set(pendingSubmissionsRef.current));
+      }
     }
 
     function handleSend(): void {
       const text = input.trim();
       const hasPayload = text.length > 0 || attachments.length > 0;
-      if (!hasPayload || isLoading) return;
+      if (!hasPayload) return;
       setSlashMenuOpen(false);
-      const sendAttachments = attachments;
-      clearAfterSend(text);
-      onSubmit(text, sendAttachments);
+      void submit(text, attachments, onSubmit);
     }
 
     function handleQuickAsk(): void {
       const text = input.trim();
-      if (!text || isLoading) return;
-      const sendAttachments = attachments;
-      clearAfterSend(text);
-      onQuickAsk(text, sendAttachments);
+      if (!text) return;
+      void submit(text, attachments, onQuickAsk);
     }
 
     function handleSlashSelect(cmd: SlashCommand): void {
       setSlashMenuOpen(false);
-      // Local / info commands dispatch immediately — let parent route through onSubmit
-      if (cmd.local || cmd.category === "info") {
-        setInput("");
-        if (inputRef.current) inputRef.current.style.height = "auto";
-        onSubmit(cmd.name, []);
+      if (!cmd.takesArgs) {
+        void submit(cmd.name, [], onSubmit);
         return;
       }
-      // Backend commands that take arguments: insert prefix and wait for the user
-      setInput(cmd.name + " ");
+      setInput(`${cmd.name} `);
       inputRef.current?.focus();
     }
 
@@ -244,25 +481,22 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     ): void {
       const value = e.target.value;
       setInput(value);
-
-      const target = e.target;
-      requestAnimationFrame(() => {
-        target.style.height = "auto";
-        target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-      });
+      // Height is handled by the useLayoutEffect on `input` above.
 
       if (value.startsWith("/") && !value.includes(" ")) {
-        const query = value.split(" ")[0];
+        // No space yet, so the whole value is the command query.
         setSlashMenuOpen(true);
-        setSlashFilter(query);
+        setSlashFilter(value);
         setSlashSelectedIndex(0);
+        setSlashMenuScrollTop(0);
+        if (slashMenuListRef.current) slashMenuListRef.current.scrollTop = 0;
       } else if (slashMenuOpen) {
         setSlashMenuOpen(false);
       }
     }
 
     function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>): void {
-      if (isImeComposing(e)) return;
+      if (isImeComposing(e) || composingRef.current) return;
 
       // Slash menu keyboard navigation
       if (slashMenuOpen && filteredSlashCommands.length > 0) {
@@ -338,32 +572,159 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       setAttachmentError(null);
     }
 
+    // Pre-send validation gate (#369): even with the queue model from
+    // PR #379, we still block Send when readiness fails — a queued message
+    // with a missing API key would just fail later. The !isLoading gate
+    // is intentionally dropped here vs. the pre-merge version, so users
+    // can queue messages while the agent is mid-response.
+    const readinessOk = readiness?.ok !== false;
+    const submissionPending = pendingSubmissions.has(
+      JSON.stringify([
+        submissionScope,
+        submissionGenerationRef.current,
+        input,
+        attachments.map((attachment) => attachment.id),
+      ]),
+    );
     const canSend =
-      (input.trim().length > 0 || attachments.length > 0) && !isLoading;
+      (input.trim().length > 0 || attachments.length > 0) &&
+      readinessOk &&
+      !submissionPending;
+
+    // Map fixLocation → user-facing call to action. The strings are
+    // wrapped in i18n; the location ids come from main/validation.ts.
+    function readinessFixLabel(loc: string | undefined): string {
+      switch (loc) {
+        case "providers":
+          return t("chat.validation.fixInProviders");
+        case "models":
+          return t("chat.validation.fixInModels");
+        case "gateway":
+          return t("chat.validation.fixInGateway");
+        case "setup":
+          return t("chat.validation.fixInSetup");
+        default:
+          return "";
+      }
+    }
 
     return (
       <>
         {slashMenuOpen && filteredSlashCommands.length > 0 && (
-          <div className="slash-menu" ref={slashMenuRef}>
-            <div className="slash-menu-header">
-              <Slash size={12} />
-              {t("chat.commandsTitle")}
-            </div>
-            <div className="slash-menu-list">
-              {filteredSlashCommands.map((cmd, i) => (
-                <button
-                  key={cmd.name}
-                  className={`slash-menu-item ${i === slashSelectedIndex ? "slash-menu-item-active" : ""}`}
-                  onMouseEnter={() => setSlashSelectedIndex(i)}
-                  onClick={() => handleSlashSelect(cmd)}
+          <div
+            className="slash-menu-overlay"
+            onMouseDown={() => setSlashMenuOpen(false)}
+          >
+            <div
+              className="slash-menu"
+              ref={slashMenuRef}
+              role="dialog"
+              aria-modal="true"
+              aria-label={t("chat.commandsTitle")}
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <div className="slash-menu-search">
+                <Search size={16} aria-hidden />
+                <span className="slash-menu-search-query">
+                  {slashFilter || "/"}
+                </span>
+                <kbd>esc</kbd>
+              </div>
+              <div
+                className="slash-menu-list"
+                ref={slashMenuListRef}
+                role="listbox"
+                aria-label={t("chat.commandsTitle")}
+                onScroll={(event) =>
+                  setSlashMenuScrollTop(event.currentTarget.scrollTop)
+                }
+              >
+                <div
+                  className="slash-menu-virtual-content"
+                  style={{ height: slashVirtualLayout.totalHeight }}
                 >
-                  <span className="slash-menu-item-name">{cmd.name}</span>
-                  <span className="slash-menu-item-desc">
-                    {cmd.description}
-                  </span>
-                </button>
-              ))}
+                  {visibleSlashRows.map((row) =>
+                    row.kind === "group" ? (
+                      <div
+                        className="slash-menu-group-label"
+                        key={`group-${row.category}`}
+                        style={{
+                          height: row.height,
+                          transform: `translateY(${row.top}px)`,
+                        }}
+                      >
+                        {slashCategoryLabel(row.category)}
+                      </div>
+                    ) : (
+                      <button
+                        key={row.command.name}
+                        role="option"
+                        aria-selected={row.commandIndex === slashSelectedIndex}
+                        className={`slash-menu-item ${row.commandIndex === slashSelectedIndex ? "slash-menu-item-active" : ""}`}
+                        style={{
+                          height: row.height,
+                          transform: `translateY(${row.top}px)`,
+                        }}
+                        onMouseEnter={() =>
+                          setSlashSelectedIndex(row.commandIndex)
+                        }
+                        onClick={() => handleSlashSelect(row.command)}
+                      >
+                        <SlashCommandIcon
+                          name={row.command.name}
+                          category={row.command.category}
+                          className="slash-menu-item-icon"
+                          size={10}
+                        />
+                        <span className="slash-menu-item-name">
+                          {row.command.name?.replace(/^\//, "")}
+                        </span>
+                        <span className="slash-menu-item-desc">
+                          {row.command.description}
+                        </span>
+                        <span className="slash-menu-item-badge">
+                          {slashCategoryLabel(row.command.category)}
+                        </span>
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+              <div className="slash-menu-footer">
+                <span>
+                  <kbd>↑↓</kbd> navigate
+                </span>
+                <span>
+                  <kbd>↵</kbd> select
+                </span>
+                <span>
+                  <kbd>tab</kbd> complete
+                </span>
+                <span className="slash-menu-count">
+                  {filteredSlashCommands.length} commands
+                </span>
+              </div>
             </div>
+          </div>
+        )}
+        {!readinessOk && readiness?.message && (
+          <div
+            className="chat-readiness-banner"
+            role="alert"
+            data-testid="chat-readiness-banner"
+          >
+            <span className="chat-readiness-message">
+              {readiness.expectedEnvKey
+                ? t("chat.validation.missingKey", {
+                    key: readiness.expectedEnvKey,
+                  })
+                : readiness.message}
+            </span>
+            {readiness.fixLocation && (
+              <span className="chat-readiness-fix">
+                {readinessFixLabel(readiness.fixLocation)}
+              </span>
+            )}
           </div>
         )}
         {(attachments.length > 0 || attachmentError) && (
@@ -382,65 +743,136 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             )}
           </div>
         )}
-        <div className="chat-input-wrapper">
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            style={{ display: "none" }}
-            onChange={handleFileInputChange}
-          />
-          <button
-            className="chat-attach-btn"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isLoading}
-            title={t("chat.attach")}
-            aria-label={t("chat.attach")}
-            type="button"
-          >
-            <Paperclip size={16} />
-          </button>
-          <textarea
-            ref={inputRef}
-            className="chat-input"
-            placeholder={t("chat.typeMessage")}
-            value={input}
-            onChange={handleInputChange}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            rows={1}
-            autoFocus
-            dir="auto"
-          />
-          {isLoading ? (
-            <button
-              className="chat-send-btn chat-stop-btn"
-              onClick={onAbort}
-              title={t("common.stop")}
-            >
-              <Stop size={14} />
-            </button>
-          ) : (
-            <>
-              {input.trim() && hasSession && (
+        {voice.error && (
+          <div className="chat-attachment-error chat-voice-error" role="alert">
+            {voice.error}
+          </div>
+        )}
+        {submissionError && (
+          <div className="chat-attachment-error" role="alert">
+            {submissionError}
+          </div>
+        )}
+        <div className="chat-input-shell">
+          <div className="chat-input-wrapper">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              style={{ display: "none" }}
+              onChange={handleFileInputChange}
+            />
+            <textarea
+              ref={inputRef}
+              className="chat-input"
+              placeholder={t("chat.typeMessage")}
+              value={input}
+              onChange={handleInputChange}
+              onKeyDown={handleKeyDown}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingRef.current = false;
+              }}
+              onPaste={handlePaste}
+              rows={1}
+              spellCheck={spellcheckEnabled}
+              autoFocus
+              dir="auto"
+            />
+            <div className="chat-input-toolbar">
+              <button
+                className="chat-attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                title={t("chat.attach")}
+                aria-label={t("chat.attach")}
+                type="button"
+              >
+                <Paperclip size={16} />
+              </button>
+              {voice.supported && (
                 <button
-                  className="chat-btw-btn"
-                  onClick={handleQuickAsk}
-                  title={t("chat.quickAskTitle")}
+                  className={`chat-mic-btn${
+                    voice.recording ? " chat-mic-btn--recording" : ""
+                  }`}
+                  onClick={() => {
+                    // Snapshot the current text so live results append to it.
+                    if (!voice.recording && !voice.transcribing) {
+                      voiceBaseRef.current = input;
+                    }
+                    voice.toggle();
+                  }}
+                  disabled={voice.transcribing}
+                  title={
+                    voice.transcribing
+                      ? t("chat.voiceTranscribing")
+                      : voice.recording
+                        ? t("chat.voiceStop")
+                        : t("chat.voiceInput")
+                  }
+                  aria-label={
+                    voice.recording ? t("chat.voiceStop") : t("chat.voiceInput")
+                  }
+                  aria-pressed={voice.recording}
+                  type="button"
                 >
-                  💭
+                  <Mic size={16} />
                 </button>
               )}
-              <button
-                className="chat-send-btn"
-                onClick={handleSend}
-                disabled={!canSend}
-                title={t("chat.send")}
-              >
-                <Send size={16} />
-              </button>
-            </>
-          )}
+              {toolbarExtras && (
+                <>
+                  <span className="chat-input-toolbar-divider" aria-hidden />
+                  {toolbarExtras}
+                </>
+              )}
+              <div className="chat-input-toolbar-spacer" />
+              {contextUsage && contextUsage.used > 0 && (
+                <ContextGauge {...contextUsage} />
+              )}
+              {isLoading ? (
+                <button
+                  className="chat-send-btn chat-stop-btn"
+                  onClick={onAbort}
+                  title={t("common.stop")}
+                >
+                  <Stop size={14} />
+                </button>
+              ) : (
+                <>
+                  {input.trim() && hasSession && (
+                    <button
+                      className="chat-btw-btn"
+                      onClick={handleQuickAsk}
+                      disabled={submissionPending}
+                      title={t("chat.quickAskTitle")}
+                    >
+                      💭
+                    </button>
+                  )}
+                  <button
+                    className="chat-send-btn"
+                    onClick={handleSend}
+                    disabled={!canSend}
+                    title={t("chat.send")}
+                  >
+                    <ArrowUp size={20} />
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+          <BorderBeam
+            aria-hidden="true"
+            className="chat-input-beam"
+            size="pulse-inner"
+            colorVariant="mono"
+            strength={0.7}
+            theme={beamTheme}
+          >
+            <span className="chat-input-beam-surface" />
+          </BorderBeam>
         </div>
       </>
     );

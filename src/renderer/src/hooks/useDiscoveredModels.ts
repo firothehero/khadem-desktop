@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 export type DiscoveryStatus =
   | "idle"
@@ -16,7 +16,7 @@ export interface UseDiscoveredModelsArgs {
   // reading the matching <NAME>_API_KEY from the profile's .env.
   apiKey?: string;
   profile?: string;
-  // When true the hook is paused — used so the Providers page only fires
+  // When false the hook is paused — used so the Providers page only fires
   // after the user has finished switching providers, and so the Models
   // modal doesn't fire before it's even open.
   enabled?: boolean;
@@ -29,6 +29,10 @@ export interface UseDiscoveredModelsResult {
   models: string[];
   status: DiscoveryStatus;
   cached: boolean;
+  /** Subset of `models` that the provider's catalog flags as free.
+   *  Renderer surfaces this as an "(free)" suffix in autocomplete.
+   *  Empty/undefined for providers without pricing info. Issue #367. */
+  freeModels: string[];
 }
 
 /**
@@ -39,20 +43,30 @@ export interface UseDiscoveredModelsResult {
 export function useDiscoveredModels(
   args: UseDiscoveredModelsArgs,
 ): UseDiscoveredModelsResult {
-  const { provider, baseUrl, apiKey, profile, enabled = true, refreshToken } = args;
+  const {
+    provider,
+    baseUrl,
+    apiKey,
+    profile,
+    enabled = true,
+    refreshToken,
+  } = args;
   const [models, setModels] = useState<string[]>([]);
   const [status, setStatus] = useState<DiscoveryStatus>("idle");
   const [cached, setCached] = useState(false);
-  const cancelRef = useRef(0);
+  const [freeModels, setFreeModels] = useState<string[]>([]);
 
   useEffect(() => {
+    let cancelled = false;
+    // Results belong to this complete discovery request, not just its provider
+    // slug. Do not offer the previous endpoint/profile's models while loading.
+    setModels([]);
+    setCached(false);
+    setFreeModels([]);
     if (!enabled || !provider) {
       setStatus("idle");
-      setModels([]);
-      setCached(false);
       return;
     }
-    const seq = ++cancelRef.current;
     setStatus("loading");
     const handle = setTimeout(async () => {
       try {
@@ -62,21 +76,24 @@ export function useDiscoveredModels(
           apiKey,
           profile,
         );
-        if (seq !== cancelRef.current) return; // a later call superseded us
+        if (cancelled) return; // a later call superseded us
         setModels(result.models);
         setCached(result.cached);
         setStatus(result.status);
+        setFreeModels(result.freeModels ?? []);
       } catch {
-        if (seq !== cancelRef.current) return;
+        if (cancelled) return;
         setStatus("error");
         setModels([]);
         setCached(false);
+        setFreeModels([]);
       }
     }, 400);
     return (): void => {
+      cancelled = true;
       clearTimeout(handle);
     };
   }, [enabled, provider, baseUrl, apiKey, profile, refreshToken]);
 
-  return { models, status, cached };
+  return { models, status, cached, freeModels };
 }

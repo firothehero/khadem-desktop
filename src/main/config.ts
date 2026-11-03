@@ -1,5 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
+import { randomBytes } from "crypto";
+import { dirname, join } from "path";
+import type { SpeechConfigSetting } from "../shared/minimax-speech";
 import { HERMES_HOME, expectedEnvKeyForModel } from "./installer";
 import {
   escapeRegex,
@@ -9,6 +11,28 @@ import {
   safeWriteFile,
 } from "./utils";
 import { getYamlPath } from "./yaml-path";
+import { splitSingleYamlDocument } from "./yaml-document";
+// NOTE: ./secrets imports back into this module (getConfigValue / readEnv), so
+// this is a static import that closes a cycle (config -> secrets ->
+// commandProvider -> config). It is safe ONLY because BOTH sides defer all work
+// to call time: config.ts calls the three fns below inside function bodies, and
+// secrets/index.ts constructs its providers LAZILY (no `new` at module-init).
+// If you make secrets/index.ts construct a provider at module scope again, this
+// static import will throw "X is not a constructor" on load-order-dependent
+// paths. Keep provider construction lazy there, or make this import lazy here.
+import {
+  getSecretsProvider,
+  providerListSafe,
+  invalidateProviderListCache,
+} from "./secrets";
+import { canonicalProviderBaseUrl } from "./provider-registry";
+import {
+  customProviderEnvKey,
+  expectedEnvKeyForUrl,
+  OPENAI_COMPAT_PROVIDERS,
+} from "../shared/url-key-map";
+import { readModelsRaw } from "./models";
+import { normalizeModelEndpointUrl } from "../shared/model-endpoint";
 
 // ── Connection Config (local / remote / ssh) ─────────────
 
@@ -19,18 +43,47 @@ export interface SshConnectionConfig {
   keyPath: string;
   remotePort: number;
   localPort: number;
+  // Docker container on the SSH host that runs Hermes (issue #432). Used by
+  // the Settings/Welcome target inspection UI; the runtime itself routes
+  // through the provisioned remote launcher hook, not this name.
+  dockerContainerName?: string;
 }
+
+export type RemoteChatTransport = "auto" | "dashboard" | "legacy";
+export type RemoteAuthMode = "auto" | "token" | "oauth";
 
 export interface ConnectionConfig {
   mode: "local" | "remote" | "ssh";
   remoteUrl: string;
   apiKey: string;
+  remoteAuthMode: RemoteAuthMode;
+  remoteChatTransport: RemoteChatTransport;
+  sshChatTransport: RemoteChatTransport;
   ssh: SshConnectionConfig;
 }
 
+export const CONNECTION_REGISTRY_VERSION = 1 as const;
+
+export interface ConnectionRecord {
+  connectionId: string;
+  name: string;
+  config: ConnectionConfig;
+}
+
+export interface ConnectionRegistry {
+  version: typeof CONNECTION_REGISTRY_VERSION;
+  activeConnectionId: string;
+  connections: ConnectionRecord[];
+}
+
 export interface PublicConnectionConfig {
+  connectionId: string;
+  name: string;
   mode: "local" | "remote" | "ssh";
   remoteUrl: string;
+  remoteAuthMode: RemoteAuthMode;
+  remoteChatTransport: RemoteChatTransport;
+  sshChatTransport: RemoteChatTransport;
   hasApiKey: boolean;
   // Length of the stored API key, exposed so the renderer can show a
   // mask that matches the real value's width. The secret itself never
@@ -39,77 +92,384 @@ export interface PublicConnectionConfig {
   ssh: SshConnectionConfig;
 }
 
+export interface PublicConnectionRegistry {
+  version: typeof CONNECTION_REGISTRY_VERSION;
+  activeConnectionId: string;
+  connections: PublicConnectionConfig[];
+}
+
 // Lazy getter — avoids circular dependency with installer.ts
 // (HERMES_HOME may not be assigned yet when this module first loads)
 function desktopConfigFile(): string {
   return join(HERMES_HOME, "desktop.json");
 }
 
+export function normalizeRemoteChatTransport(
+  value: unknown,
+): RemoteChatTransport {
+  return value === "dashboard" || value === "legacy" ? value : "auto";
+}
+
+export function normalizeRemoteAuthMode(value: unknown): RemoteAuthMode {
+  return value === "token" || value === "oauth" ? value : "auto";
+}
+
 export function readDesktopConfig(): Record<string, unknown> {
   try {
     const f = desktopConfigFile();
     if (!existsSync(f)) return {};
-    return JSON.parse(readFileSync(f, "utf-8"));
+    return JSON.parse(readFileSync(f, "utf-8").replace(/^\uFEFF/, ""));
   } catch {
     return {};
   }
 }
 
-export function writeDesktopConfig(data: Record<string, unknown>): void {
-  if (!existsSync(HERMES_HOME)) {
-    mkdirSync(HERMES_HOME, { recursive: true });
+function readConnectionDesktopConfig(): Record<string, unknown> {
+  const file = desktopConfigFile();
+  if (!existsSync(file)) return {};
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(file, "utf-8").replace(/^\uFEFF/, ""),
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("invalid root");
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      "Hermes Desktop could not read desktop.json; the existing file was left unchanged.",
+    );
   }
-  writeFileSync(desktopConfigFile(), JSON.stringify(data, null, 2), "utf-8");
 }
 
-export function getConnectionConfig(): ConnectionConfig {
-  const data = readDesktopConfig();
-  const ssh = (data.sshConfig as Partial<SshConnectionConfig>) ?? {};
+export function writeDesktopConfig(data: Record<string, unknown>): void {
+  // Refuse to replace an unreadable existing document. Callers often perform
+  // read-modify-write updates, and the tolerant read API returns {} on parse
+  // failure for legacy display paths.
+  readConnectionDesktopConfig();
+  safeWriteFile(desktopConfigFile(), JSON.stringify(data, null, 2));
+}
+
+function normalizeConnectionConfig(
+  value: Partial<ConnectionConfig>,
+): ConnectionConfig {
+  const ssh: Partial<SshConnectionConfig> = value.ssh ?? {};
   return {
-    mode: (data.connectionMode as "local" | "remote" | "ssh") || "local",
-    remoteUrl: (data.remoteUrl as string) || "",
-    apiKey: (data.remoteApiKey as string) || "",
+    mode:
+      value.mode === "remote" || value.mode === "ssh" ? value.mode : "local",
+    remoteUrl: typeof value.remoteUrl === "string" ? value.remoteUrl : "",
+    apiKey: typeof value.apiKey === "string" ? value.apiKey : "",
+    remoteAuthMode: normalizeRemoteAuthMode(value.remoteAuthMode),
+    remoteChatTransport: normalizeRemoteChatTransport(
+      value.remoteChatTransport,
+    ),
+    sshChatTransport: normalizeRemoteChatTransport(value.sshChatTransport),
     ssh: {
-      host: (ssh.host as string) || "",
-      port: (ssh.port as number) || 22,
-      username: (ssh.username as string) || "",
-      keyPath: (ssh.keyPath as string) || "",
-      remotePort: (ssh.remotePort as number) || 8642,
-      localPort: (ssh.localPort as number) || 18642,
+      host: typeof ssh.host === "string" ? ssh.host : "",
+      port: typeof ssh.port === "number" ? ssh.port : 22,
+      username: typeof ssh.username === "string" ? ssh.username : "",
+      keyPath: typeof ssh.keyPath === "string" ? ssh.keyPath : "",
+      remotePort: typeof ssh.remotePort === "number" ? ssh.remotePort : 8642,
+      localPort: typeof ssh.localPort === "number" ? ssh.localPort : 18642,
+      dockerContainerName:
+        typeof ssh.dockerContainerName === "string"
+          ? ssh.dockerContainerName
+          : "",
     },
   };
 }
 
-export function getPublicConnectionConfig(): PublicConnectionConfig {
-  const config = getConnectionConfig();
+function legacyConnectionConfig(
+  data: Record<string, unknown>,
+): ConnectionConfig {
+  return normalizeConnectionConfig({
+    mode: data.connectionMode as ConnectionConfig["mode"],
+    remoteUrl: data.remoteUrl as string,
+    apiKey: data.remoteApiKey as string,
+    remoteAuthMode: data.remoteAuthMode as RemoteAuthMode,
+    remoteChatTransport: data.remoteChatTransport as RemoteChatTransport,
+    sshChatTransport: data.sshChatTransport as RemoteChatTransport,
+    ssh: data.sshConfig as SshConnectionConfig,
+  });
+}
+
+function migratedConnectionName(config: ConnectionConfig): string {
+  if (config.mode === "remote") return "Remote";
+  if (config.mode === "ssh") return "SSH";
+  return "Local";
+}
+
+function parseConnectionRegistry(value: unknown): ConnectionRegistry | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<ConnectionRegistry>;
+  if (
+    candidate.version !== CONNECTION_REGISTRY_VERSION ||
+    !Array.isArray(candidate.connections) ||
+    candidate.connections.length === 0
+  ) {
+    return null;
+  }
+
+  const connectionIds = new Set<string>();
+  const connections = candidate.connections.flatMap((record) => {
+    if (
+      !record ||
+      typeof record.connectionId !== "string" ||
+      !/^connection-[0-9a-f]{24}$/.test(record.connectionId) ||
+      connectionIds.has(record.connectionId) ||
+      typeof record.name !== "string" ||
+      !record.name ||
+      !record.config ||
+      typeof record.config !== "object" ||
+      Array.isArray(record.config)
+    ) {
+      return [];
+    }
+    connectionIds.add(record.connectionId);
+    return [
+      {
+        connectionId: record.connectionId,
+        name: record.name,
+        config: normalizeConnectionConfig(record.config ?? {}),
+      },
+    ];
+  });
+  if (connections.length !== candidate.connections.length) return null;
+
+  if (
+    typeof candidate.activeConnectionId !== "string" ||
+    !connections.some(
+      ({ connectionId }) => connectionId === candidate.activeConnectionId,
+    )
+  ) {
+    return null;
+  }
   return {
+    version: CONNECTION_REGISTRY_VERSION,
+    activeConnectionId: candidate.activeConnectionId,
+    connections,
+  };
+}
+
+function deleteLegacyConnectionFields(data: Record<string, unknown>): void {
+  delete data.connectionMode;
+  delete data.remoteUrl;
+  delete data.remoteApiKey;
+  delete data.remoteAuthMode;
+  delete data.remoteChatTransport;
+  delete data.sshChatTransport;
+  delete data.sshConfig;
+}
+
+function connectionRegistryFromDesktopConfig(data: Record<string, unknown>): {
+  registry: ConnectionRegistry;
+  migrated: boolean;
+} {
+  const existing = parseConnectionRegistry(data.connectionRegistry);
+  if (existing) return { registry: existing, migrated: false };
+  if ("connectionRegistry" in data) {
+    throw new Error(
+      "Hermes Desktop found an unsupported or invalid connection registry; the existing file was left unchanged.",
+    );
+  }
+
+  const config = legacyConnectionConfig(data);
+  const connectionId = `connection-${randomBytes(12).toString("hex")}`;
+  return {
+    registry: {
+      version: CONNECTION_REGISTRY_VERSION,
+      activeConnectionId: connectionId,
+      connections: [
+        { connectionId, name: migratedConnectionName(config), config },
+      ],
+    },
+    migrated: true,
+  };
+}
+
+function saveConnectionRegistry(
+  data: Record<string, unknown>,
+  registry: ConnectionRegistry,
+): void {
+  data.connectionRegistry = registry;
+  deleteLegacyConnectionFields(data);
+  writeDesktopConfig(data);
+}
+
+// @lat: [[connections#Versioned registry]]
+export function getConnectionRegistry(): ConnectionRegistry {
+  const data = readConnectionDesktopConfig();
+  const { registry, migrated } = connectionRegistryFromDesktopConfig(data);
+  if (migrated) {
+    saveConnectionRegistry(data, registry);
+  }
+  return registry;
+}
+
+function getConnection(connectionId?: unknown): ConnectionRecord {
+  const registry = getConnectionRegistry();
+  if (
+    connectionId !== undefined &&
+    (typeof connectionId !== "string" || !connectionId)
+  ) {
+    throw new Error("Connection not found.");
+  }
+  const targetConnectionId = connectionId ?? registry.activeConnectionId;
+  const connection = registry.connections.find(
+    (candidate) => candidate.connectionId === targetConnectionId,
+  );
+  if (!connection) {
+    throw new Error(`Unknown connection: ${targetConnectionId}`);
+  }
+  return connection;
+}
+
+export function getActiveConnection(): ConnectionRecord {
+  return getConnection();
+}
+
+export function getConnectionConfig(connectionId?: unknown): ConnectionConfig {
+  return getConnection(connectionId).config;
+}
+
+function publicConnectionConfig(
+  connection: ConnectionRecord,
+): PublicConnectionConfig {
+  const config = connection.config;
+  return {
+    connectionId: connection.connectionId,
+    name: connection.name,
     mode: config.mode,
     remoteUrl: config.remoteUrl,
+    remoteAuthMode: config.remoteAuthMode,
+    remoteChatTransport: config.remoteChatTransport,
+    sshChatTransport: config.sshChatTransport,
     hasApiKey: config.apiKey.length > 0,
     apiKeyLength: config.apiKey.length,
     ssh: config.ssh,
   };
 }
 
-export function setConnectionConfig(config: ConnectionConfig): void {
-  const data = readDesktopConfig();
-  data.connectionMode = config.mode;
-  data.remoteUrl = config.remoteUrl;
-  data.remoteApiKey = config.apiKey;
-  if (config.mode === "ssh") {
-    data.sshConfig = config.ssh;
+export function getPublicConnectionConfig(
+  connectionId?: unknown,
+): PublicConnectionConfig {
+  return publicConnectionConfig(getConnection(connectionId));
+}
+
+export function getPublicConnectionRegistry(): PublicConnectionRegistry {
+  const registry = getConnectionRegistry();
+  return {
+    version: registry.version,
+    activeConnectionId: registry.activeConnectionId,
+    connections: registry.connections.map(publicConnectionConfig),
+  };
+}
+
+export function createConnection(): ConnectionRecord {
+  const data = readConnectionDesktopConfig();
+  const { registry } = connectionRegistryFromDesktopConfig(data);
+  const connection: ConnectionRecord = {
+    connectionId: `connection-${randomBytes(12).toString("hex")}`,
+    name: `New connection ${registry.connections.length + 1}`,
+    config: normalizeConnectionConfig({}),
+  };
+  registry.connections.push(connection);
+  registry.activeConnectionId = connection.connectionId;
+  saveConnectionRegistry(data, registry);
+  return connection;
+}
+
+export function renameConnection(connectionId: unknown, name: unknown): void {
+  const nextName = typeof name === "string" ? name.trim() : "";
+  if (!nextName || nextName.length > 80) {
+    throw new Error("Connection names must be between 1 and 80 characters.");
   }
-  writeDesktopConfig(data);
+  if (typeof connectionId !== "string") {
+    throw new Error("Connection not found.");
+  }
+  const data = readConnectionDesktopConfig();
+  const { registry } = connectionRegistryFromDesktopConfig(data);
+  const connection = registry.connections.find(
+    (candidate) => candidate.connectionId === connectionId,
+  );
+  if (!connection) throw new Error("Connection not found.");
+  connection.name = nextName;
+  saveConnectionRegistry(data, registry);
+}
+
+export function selectConnection(connectionId: unknown): void {
+  if (typeof connectionId !== "string") {
+    throw new Error("Connection not found.");
+  }
+  const data = readConnectionDesktopConfig();
+  const { registry } = connectionRegistryFromDesktopConfig(data);
+  if (
+    !registry.connections.some(
+      (connection) => connection.connectionId === connectionId,
+    )
+  ) {
+    throw new Error("Connection not found.");
+  }
+  registry.activeConnectionId = connectionId;
+  saveConnectionRegistry(data, registry);
+}
+
+export function removeConnection(connectionId: unknown): void {
+  if (typeof connectionId !== "string") {
+    throw new Error("Connection not found.");
+  }
+  const data = readConnectionDesktopConfig();
+  const { registry } = connectionRegistryFromDesktopConfig(data);
+  if (registry.connections.length === 1) {
+    throw new Error("The last connection cannot be removed.");
+  }
+  const index = registry.connections.findIndex(
+    (connection) => connection.connectionId === connectionId,
+  );
+  if (index === -1) throw new Error("Connection not found.");
+  registry.connections.splice(index, 1);
+  if (registry.activeConnectionId === connectionId) {
+    registry.activeConnectionId = registry.connections[0].connectionId;
+  }
+  saveConnectionRegistry(data, registry);
+}
+
+export function setConnectionConfig(config: ConnectionConfig): void {
+  const data = readConnectionDesktopConfig();
+  const { registry } = connectionRegistryFromDesktopConfig(data);
+  const activeIndex = registry.connections.findIndex(
+    ({ connectionId }) => connectionId === registry.activeConnectionId,
+  );
+  const active = registry.connections[activeIndex];
+  const previousDefaultName = migratedConnectionName(active.config);
+  const nextConfig = normalizeConnectionConfig({
+    ...config,
+    remoteUrl:
+      config.mode === "remote" || config.remoteUrl.trim()
+        ? config.remoteUrl
+        : active.config.remoteUrl,
+    apiKey:
+      config.mode === "remote" || config.apiKey.trim()
+        ? config.apiKey
+        : active.config.apiKey,
+    ssh: config.mode === "ssh" ? config.ssh : active.config.ssh,
+  });
+  active.config = nextConfig;
+  if (active.name === previousDefaultName) {
+    active.name = migratedConnectionName(nextConfig);
+  }
+  registry.connections[activeIndex] = active;
+  saveConnectionRegistry(data, registry);
 }
 
 export function resolveConnectionApiKeyUpdate(
   existing: ConnectionConfig,
-  mode: "local" | "remote" | "ssh",
+  _mode: "local" | "remote" | "ssh",
   remoteUrl: string,
   apiKey?: string,
 ): string {
   if (apiKey !== undefined) return apiKey;
-  if (existing.mode === mode && existing.remoteUrl === remoteUrl) {
+  if (remoteUrl.trim() && existing.remoteUrl === remoteUrl) {
     return existing.apiKey;
   }
   return "";
@@ -138,6 +498,23 @@ function invalidateCache(prefix: string): void {
   for (const key of _cache.keys()) {
     if (key.startsWith(prefix)) _cache.delete(key);
   }
+}
+
+/**
+ * Drop all secrets-related cache entries (the parsed `env:*` views and the
+ * resolved `apiServerKey:*` values, every profile). Call after a vault
+ * rotation / secrets-add / secrets-inject so the next `getSecret` /
+ * `getApiServerKey` lookup re-resolves through the live provider instead of
+ * serving a value cached up to 5s ago (which can 401 against a rotated key).
+ * Does NOT spawn the provider — it only clears cached values.
+ */
+export function invalidateSecretsCache(): void {
+  invalidateCache("env:");
+  invalidateCache("apiServerKey:");
+  // Also drop the secrets-layer list() cache so a vault rotation is visible
+  // on the next provider read (S1: that cache is the helper-spawn rate floor,
+  // explicit invalidation is the one sanctioned way to bust it early).
+  invalidateProviderListCache();
 }
 
 export function readEnv(profile?: string): Record<string, string> {
@@ -233,6 +610,56 @@ function stripYamlQuotes(raw: string): string {
   return trimmed;
 }
 
+function quoteYamlScalar(value: string): string {
+  return JSON.stringify(value);
+}
+
+function appendDirectNestedYamlValue(
+  content: string,
+  segments: string[],
+  value: string,
+): string | null {
+  if (segments.length !== 2) return null;
+  const [parent, child] = segments;
+  if (!parent || !child) return null;
+
+  const newline = content.includes("\r\n") ? "\r\n" : "\n";
+  const quotedValue = quoteYamlScalar(value);
+  const parentRe = new RegExp(
+    `^${escapeRegex(parent)}:[ \\t]*(#.*)?(?:\\r?\\n|$)`,
+    "m",
+  );
+  const parentMatch = parentRe.exec(content);
+
+  if (!parentMatch || parentMatch.index === undefined) {
+    const sep = content === "" || content.endsWith("\n") ? "" : newline;
+    return `${content}${sep}${parent}:${newline}  ${child}: ${quotedValue}${newline}`;
+  }
+
+  const blockStart = parentMatch.index + parentMatch[0].length;
+  let blockEnd = blockStart;
+  let cursor = blockStart;
+
+  while (cursor < content.length) {
+    const lineEnd = content.indexOf("\n", cursor);
+    const lineEndExclusive = lineEnd === -1 ? content.length : lineEnd;
+    const line = content.slice(cursor, lineEndExclusive);
+
+    if (line.trim() !== "" && !/^[ \t]/.test(line)) {
+      break;
+    }
+
+    blockEnd =
+      lineEndExclusive === content.length
+        ? content.length
+        : lineEndExclusive + 1;
+    cursor = blockEnd;
+  }
+
+  const insertion = `  ${child}: ${quotedValue}${newline}`;
+  return `${content.slice(0, blockEnd)}${insertion}${content.slice(blockEnd)}`;
+}
+
 /**
  * Locate a dotted YAML path in `content` (e.g. "agent.service_tier" finds
  * the `service_tier` field nested under top-level `agent:`). Returns the
@@ -311,6 +738,7 @@ function findSegmentInBlock(
   startAt: number,
   parentIndent: number,
   segment: string,
+  stripCarriageReturn = false,
 ): SegmentMatch | null {
   // Walk lines from startAt until we leave the parent's block (a line
   // with indent <= parentIndent). Within the block, return the first
@@ -323,7 +751,8 @@ function findSegmentInBlock(
   while (cursor < content.length) {
     const lineEnd = content.indexOf("\n", cursor);
     const lineEndExclusive = lineEnd === -1 ? content.length : lineEnd;
-    const line = content.slice(cursor, lineEndExclusive);
+    const rawLine = content.slice(cursor, lineEndExclusive);
+    const line = stripCarriageReturn ? rawLine.replace(/\r$/, "") : rawLine;
     const trimmed = line.trim();
 
     if (trimmed === "" || trimmed.startsWith("#")) {
@@ -426,7 +855,18 @@ export function setConfigValue(
   value: string,
   profile?: string,
 ): void {
-  if (key === "API_SERVER_KEY") invalidateCache("apiServerKey:");
+  // Invalidate the apiServerKey cache when either of the two canonical
+  // gateway-secret locations is written: the legacy top-level
+  // `API_SERVER_KEY` *or* the hermes-agent canonical `api_server.token`
+  // path. Without the second check, editing `api_server.token` via the
+  // desktop would leave the cached value stale for up to the 5s TTL.
+  if (
+    key === "API_SERVER_KEY" ||
+    key === "api_server.token" ||
+    key.startsWith("api_server.")
+  ) {
+    invalidateCache("apiServerKey:");
+  }
   const { configFile } = profilePaths(profile);
   if (!existsSync(configFile)) return;
 
@@ -444,21 +884,198 @@ export function setConfigValue(
   if (hit) {
     content =
       content.slice(0, hit.valueStart) +
-      `"${value}"` +
+      quoteYamlScalar(value) +
       content.slice(hit.valueEnd);
     safeWriteFile(configFile, content);
     return;
   }
 
-  // Key missing. For multi-segment paths we don't know how deep the
-  // user's existing parent block goes (or which segments exist), so
-  // avoid guessing — drop the write rather than corrupting the file.
-  // Top-level single keys are safe to append.
+  // Key missing. Top-level single keys are safe to append. Direct
+  // two-segment scalar paths are also safe to create/append and are used
+  // by Settings fields such as `network.proxy`. Deeper paths remain a
+  // no-op to avoid guessing inside complex user-edited YAML.
   if (segments.length === 1) {
     const sep = content.endsWith("\n") || content === "" ? "" : "\n";
-    content = `${content}${sep}${key}: "${value}"\n`;
+    content = `${content}${sep}${key}: ${quoteYamlScalar(value)}\n`;
     safeWriteFile(configFile, content);
+    return;
   }
+
+  const nextContent = appendDirectNestedYamlValue(content, segments, value);
+  if (nextContent !== null) {
+    safeWriteFile(configFile, nextContent);
+  }
+}
+
+// @lat: [[speech-playback#Single-document configuration boundary]]
+function splitSpeechYamlDocument(
+  content: string,
+): ReturnType<typeof splitSingleYamlDocument> {
+  return splitSingleYamlDocument(content);
+}
+
+/** Insert only the known speech leaf into plain, nested YAML mappings. */
+function appendSpeechYamlValue(
+  content: string,
+  segments: readonly string[],
+  value: string,
+  newline = content.includes("\r\n") ? "\r\n" : "\n",
+): string | null {
+  let cursor = 0;
+  let parentIndent = -1;
+  for (let level = 0; level < segments.length; level++) {
+    const found = findSegmentInBlock(
+      content,
+      cursor,
+      parentIndent,
+      segments[level],
+      true,
+    );
+    if (found) {
+      if (level === segments.length - 1) {
+        // Replacing only the inline scalar must never strand a child mapping
+        // or a plain scalar continuation below the new quoted value.
+        let nextLine = found.afterLine;
+        while (nextLine < content.length) {
+          const end = content.indexOf("\n", nextLine);
+          const next = end < 0 ? content.length : end + 1;
+          const line = content.slice(nextLine, end < 0 ? next : end);
+          const trimmed = line.trimStart();
+          if (trimmed.trim() && !trimmed.startsWith("#")) {
+            const indent = line.length - trimmed.length;
+            if (indent > found.indent) return null;
+            if (
+              indent === found.indent &&
+              !/^(?:[a-zA-Z_][a-zA-Z0-9_-]*|"(?:\\.|[^"\\])*"|'(?:''|[^'])*')[ \t]*:/.test(
+                trimmed,
+              )
+            )
+              return null;
+            break;
+          }
+          nextLine = next;
+        }
+        const raw = found.rawValue.trim();
+        if (
+          ["|", ">", "&", "*", "[", "{"].includes(raw[0]) ||
+          ((raw.startsWith('"') || raw.startsWith("'")) &&
+            !raw.endsWith(raw[0]))
+        )
+          return null;
+        // The shared line scanner may include a CRLF carriage return in the
+        // scalar span. Preserve it as part of the original line ending.
+        const valueEnd =
+          content[found.valueEnd - 1] === "\r"
+            ? found.valueEnd - 1
+            : found.valueEnd;
+        // For an empty scalar the shared scanner consumes the spaces before
+        // its comment as the leading value gap. Keep explicit comment
+        // separation when inserting a quoted speech value into that gap.
+        const commentSeparator = content[valueEnd] === "#" ? " " : "";
+        return (
+          content.slice(0, found.valueStart) +
+          quoteYamlScalar(value) +
+          commentSeparator +
+          content.slice(valueEnd)
+        );
+      }
+      // Flow mappings, aliases and scalar parents need a full YAML editor.
+      if (found.rawValue.trim()) return null;
+      cursor = found.afterLine;
+      parentIndent = found.indent;
+      continue;
+    }
+    let blockEnd = cursor;
+    let childIndent = parentIndent < 0 ? 0 : parentIndent + 2;
+    let sawChild = false;
+    while (blockEnd < content.length) {
+      const end = content.indexOf("\n", blockEnd);
+      const next = end < 0 ? content.length : end + 1;
+      const line = content.slice(blockEnd, end < 0 ? next : end);
+      if (line.trim() && !line.trimStart().startsWith("#")) {
+        const indent = line.length - line.trimStart().length;
+        if (indent <= parentIndent) break;
+        if (!sawChild && !/^[ \t]*[a-zA-Z_][a-zA-Z0-9_-]*[ \t]*:/.test(line))
+          return null;
+        if (!sawChild && parentIndent >= 0) childIndent = indent;
+        if (
+          indent === childIndent &&
+          new RegExp(
+            `^[ \\t]*["']${escapeRegex(segments[level])}["'][ \\t]*:`,
+          ).test(line)
+        )
+          return null;
+        sawChild = true;
+      }
+      blockEnd = next;
+    }
+    const prefix =
+      blockEnd > 0 && !content.slice(0, blockEnd).endsWith("\n") ? newline : "";
+    const insertion = segments
+      .slice(level)
+      .map((segment, index, rest) => {
+        const pad = " ".repeat(childIndent + index * 2);
+        return `${pad}${segment}:${index === rest.length - 1 ? ` ${quoteYamlScalar(value)}` : ""}${newline}`;
+      })
+      .join("");
+    return (
+      content.slice(0, blockEnd) + prefix + insertion + content.slice(blockEnd)
+    );
+  }
+  return null;
+}
+
+// @lat: [[speech-playback#Scoped speech settings]]
+export function setMiniMaxSpeechConfigValue(
+  setting: SpeechConfigSetting,
+  value: string,
+  profile: string,
+): void {
+  const { configFile } = profilePaths(profile);
+  const content = existsSync(configFile)
+    ? readFileSync(configFile, "utf-8")
+    : "";
+  const document = splitSpeechYamlDocument(content);
+  if (!document)
+    throw new Error(
+      "Cannot update this YAML document; use a single plain mapping.",
+    );
+  const newline = content.includes("\r\n") ? "\r\n" : "\n";
+  const next = appendSpeechYamlValue(
+    document.body,
+    ["tts", "minimax", setting],
+    value,
+    newline,
+  );
+  if (next === null)
+    throw new Error(
+      "Cannot update this YAML layout; use plain speech mappings.",
+    );
+  const complete = appendSpeechYamlValue(
+    next,
+    ["tts", "provider"],
+    "minimax",
+    newline,
+  );
+  if (complete === null)
+    throw new Error(
+      "Cannot update this YAML speech provider mapping; use a plain scalar.",
+    );
+  // Verify both serialized speech values before one atomic write. Unsupported
+  // syntax must fail visibly rather than acknowledge a silent no-op.
+  if (
+    getYamlPath(complete, "tts.provider") !== "minimax" ||
+    getYamlPath(complete, `tts.minimax.${setting}`) !== value
+  ) {
+    throw new Error("Could not persist the selected speech setting.");
+  }
+  mkdirSync(dirname(configFile), { recursive: true });
+  const separator =
+    document.prefix && !document.prefix.endsWith("\n") ? newline : "";
+  safeWriteFile(
+    configFile,
+    document.prefix + separator + complete + document.suffix,
+  );
 }
 
 /**
@@ -517,7 +1134,8 @@ function readTopLevelBlock(
   while (cursor < content.length) {
     const lineEnd = content.indexOf("\n", cursor);
     const lineEndExclusive = lineEnd === -1 ? content.length : lineEnd;
-    const line = content.slice(cursor, lineEndExclusive);
+    const rawLine = content.slice(cursor, lineEndExclusive);
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 
     // Stop at a non-indented, non-empty line (= next top-level key).
     if (line.trim() !== "" && !/^\s/.test(line)) break;
@@ -594,18 +1212,122 @@ export function getModelConfig(profile?: string): {
 }
 
 /**
+ * Read the active model's manual context-window override from config.yaml's
+ * `model.context_length`, paired with the active `model.default` so callers can
+ * confirm the override applies to the model they're asking about. Returns the
+ * parsed positive token count, or null when unset/invalid. Drives the context
+ * gauge ahead of provider `/models` detection (issue: 32k-instead-of-64k).
+ */
+export function getModelContextLengthOverride(
+  profile?: string,
+): { model: string; contextLength: number } | null {
+  const { configFile } = profilePaths(profile);
+  if (!existsSync(configFile)) return null;
+  const content = readFileSync(configFile, "utf-8");
+  const { children } = readTopLevelBlock(content, "model");
+  const raw = children.get("context_length")?.value;
+  if (!raw) return null;
+  const n = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return { model: children.get("default")?.value || "", contextLength: n };
+}
+
+/**
+ * Mirror of the runtime key-resolution fallback for OpenAI-compatible /
+ * custom endpoints (see `sendMessageViaCli` in hermes.ts): the gateway tries
+ * the URL-specific key, then `CUSTOM_API_KEY`, then `OPENAI_API_KEY`. Returns
+ * true when any link in that chain is populated for `profile`.
+ *
+ * Why it exists: the pre-send readiness check and the config-health audit
+ * derive a single expected key from the base URL (e.g. a Groq URL →
+ * `GROQ_API_KEY`). But a user on the "OpenAI Compatible" provider pointed at
+ * Groq legitimately authenticates with `OPENAI_API_KEY` — the runtime falls
+ * back to it — so demanding `GROQ_API_KEY` is a false positive (the chat
+ * actually works). This lets those checks accept the same keys the gateway
+ * does. Returns false for providers the runtime does NOT route through the
+ * custom path, so their specific-key checks still apply.
+ *
+ * Named custom providers use the same endpoint identity and per-label keys
+ * as the runtime, with the model name retained for older saved rows.
+ */
+export function customEndpointKeyResolvable(
+  provider: string,
+  baseUrl: string,
+  profile?: string,
+): boolean {
+  const p = (provider || "").trim().toLowerCase();
+  if (!baseUrl || !OPENAI_COMPAT_PROVIDERS.has(p)) return false;
+
+  const env = readEnv(profile);
+  const candidates = new Set<string>([
+    expectedEnvKeyForUrl(baseUrl), // URL-specific key, or CUSTOM_API_KEY
+    "CUSTOM_API_KEY",
+    "OPENAI_API_KEY",
+  ]);
+
+  // Provider-owned models may store a per-label key like CUSTOM_PROVIDER_<NAME>_KEY.
+  // Include those so the config-health audit does not flag a configured provider
+  // whose key lives under its own env var.
+  try {
+    const modelRows = readModelsRaw();
+    const endpoint = normalizeModelEndpointUrl(baseUrl);
+    for (const row of modelRows) {
+      const label = row.providerLabel || row.name;
+      if (
+        row.provider === "custom" &&
+        label &&
+        normalizeModelEndpointUrl(row.baseUrl) === endpoint
+      ) {
+        candidates.add(customProviderEnvKey(label));
+      }
+    }
+  } catch {
+    // models.json unreadable — the fallback chain above still applies
+  }
+
+  for (const k of candidates) {
+    if ((env[k] ?? "").trim()) return true;
+  }
+  // A matching key configured in the vault satisfies the requirement too — don't
+  // return false and trigger a cascade of "MODEL_KEY_MISSING" / "set up
+  // provider" warnings for a vault-only user. NOTE: ./secrets is already
+  // statically imported at the top of this file, so this lazy require does
+  // NOT break a cycle (the cycle is already established and safe because
+  // secrets constructs its providers lazily). It is required at call time
+  // only so a test that resets modules re-binds the current ./secrets;
+  // collapsing it to the top-level static import would work equally well.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- call-time require (see note above); not a cycle-break — ./secrets is already statically imported at the top of this file.
+    const secretsMod = require("./secrets") as typeof import("./secrets");
+    const resolved = secretsMod.resolvedSecretMap(profile);
+    for (const k of candidates) {
+      if ((resolved[k] ?? "").trim()) return true;
+    }
+  } catch {
+    // secrets module not loadable — env-only view is the best we can do
+  }
+  return false;
+}
+
+/**
  * Replace a direct child's value inside a top-level YAML block in-place,
  * preserving the key's surrounding whitespace and any trailing comment.
  * When the child doesn't exist, insert it as the first sibling at the
  * block's existing indent. When the block itself doesn't exist, append
  * one with the new key inside.
  */
-function upsertBlockChild(
+export function upsertBlockChild(
   content: string,
   blockName: string,
   key: string,
   value: string,
+  // Whether to wrap the value in double quotes. Default true (every existing
+  // caller writes string scalars). Pass false for numeric/boolean scalars
+  // like `model.context_length`, which must parse as a YAML number — not a
+  // quoted string — for strict consumers.
+  quote = true,
 ): string {
+  const rendered = quote ? `"${value}"` : value;
   const { children, blockBodyStart, childIndent } = readTopLevelBlock(
     content,
     blockName,
@@ -615,13 +1337,13 @@ function upsertBlockChild(
   if (existing) {
     return (
       content.slice(0, existing.valueStart) +
-      `"${value}"` +
+      rendered +
       content.slice(existing.valueEnd)
     );
   }
 
   if (blockBodyStart !== null) {
-    const insertion = `${childIndent}${key}: "${value}"\n`;
+    const insertion = `${childIndent}${key}: ${rendered}\n`;
     return (
       content.slice(0, blockBodyStart) +
       insertion +
@@ -634,7 +1356,30 @@ function upsertBlockChild(
   // bootstrapping a fresh config.yaml) skip the separator so we don't
   // leave a stray leading blank line.
   const sep = content === "" || content.endsWith("\n") ? "" : "\n";
-  return `${content}${sep}${blockName}:\n  ${key}: "${value}"\n`;
+  return `${content}${sep}${blockName}:\n  ${key}: ${rendered}\n`;
+}
+
+/**
+ * Remove a direct child `key` from a top-level YAML block, if present. Returns
+ * the content unchanged when the block or key is absent. Counterpart to
+ * `upsertBlockChild` — used to clear an override (e.g. `model.context_length`)
+ * so auto-detection resumes rather than leaving a stale value behind.
+ */
+export function removeBlockChild(
+  content: string,
+  blockName: string,
+  key: string,
+): string {
+  const { children } = readTopLevelBlock(content, blockName);
+  const existing = children.get(key);
+  if (!existing) return content;
+  // Derive the full `  key: value` line bounds from the value offsets the
+  // reader records, then drop the whole line (including its trailing newline)
+  // so the rest of the block stays intact.
+  const lineStart = content.lastIndexOf("\n", existing.valueStart - 1) + 1;
+  const nl = content.indexOf("\n", existing.valueEnd);
+  const lineEnd = nl === -1 ? content.length : nl + 1;
+  return content.slice(0, lineStart) + content.slice(lineEnd);
 }
 
 /**
@@ -695,11 +1440,24 @@ function findModelBlockBody(
   return { start, end };
 }
 
+// @lat: [[model-context#Model context window#Storage and propagation]]
 export function setModelConfig(
   provider: string,
   model: string,
   baseUrl: string,
   profile?: string,
+  // Optional context-window override (tokens) mirrored into
+  // `model.context_length`. `undefined` leaves the key untouched (back-compat
+  // for callers that don't manage it); a positive number sets it; `null` or a
+  // non-positive number removes it (auto-detection / heuristic resumes).
+  contextLength?: number | null,
+  // Optional API-protocol override mirrored into `model.api_mode` (the agent's
+  // runtime-provider resolver reads it to pick the transport for
+  // custom/compatible endpoints). `undefined` leaves the key untouched
+  // (back-compat); a non-empty string (e.g. `"anthropic_messages"`,
+  // `"chat_completions"`) sets it; `null`/empty removes it so the agent
+  // re-detects the transport from the base URL.
+  apiMode?: string | null,
 ): void {
   invalidateCache(`mc:${profile || "default"}`);
   const { configFile } = profilePaths(profile);
@@ -716,15 +1474,37 @@ export function setModelConfig(
 
   content = upsertBlockChild(content, "model", "provider", provider);
   content = upsertBlockChild(content, "model", "default", model);
-  if (baseUrl) {
-    content = upsertBlockChild(content, "model", "base_url", baseUrl);
+
+  // Pick the effective base_url to write.  Precedence:
+  //   1. User-supplied `baseUrl` (the renderer passes this when the user
+  //      typed an explicit value into the "Base URL (optional)" field).
+  //   2. Otherwise, the canonical default for built-in providers
+  //      (DeepSeek → api.deepseek.com, Groq → api.groq.com, etc. — see
+  //      `provider-registry.ts`).
+  //   3. Otherwise (custom / auto / unknown provider with no baseUrl),
+  //      leave `base_url:` out of the model block entirely.
+  //
+  // Without (2), switching from a model with an explicit baseUrl (e.g.
+  // a previous OAuth Codex selection at `chatgpt.com/backend-api/codex`)
+  // to a built-in provider with no baseUrl in its library entry used to
+  // leave the stale URL in `config.yaml`. Chat then routed to the wrong
+  // host while still sending the new provider's key, producing a 401
+  // from OpenAI carrying e.g. a DeepSeek key. See issue analysis in
+  // PR description.
+  const effectiveBaseUrl = baseUrl || canonicalProviderBaseUrl(provider) || "";
+  if (effectiveBaseUrl) {
+    content = upsertBlockChild(content, "model", "base_url", effectiveBaseUrl);
   }
 
   // Workaround for upstream gateway bug — see pickAutoApiKeyForCustomProvider.
   // Scope all api_key add/update/remove operations to the `model:` block —
   // `auxiliary.*` subsections each carry their own `api_key:` line and must
   // not be touched.
-  const autoApiKey = pickAutoApiKeyForCustomProvider(provider, baseUrl, profile);
+  const autoApiKey = pickAutoApiKeyForCustomProvider(
+    provider,
+    baseUrl,
+    profile,
+  );
   const body = findModelBlockBody(content);
   if (body) {
     const block = content.slice(body.start, body.end);
@@ -764,7 +1544,8 @@ export function setModelConfig(
       newBlock = block.replace(apiKeyInBlock, "");
     }
     if (newBlock !== block) {
-      content = content.slice(0, body.start) + newBlock + content.slice(body.end);
+      content =
+        content.slice(0, body.start) + newBlock + content.slice(body.end);
     }
   }
 
@@ -787,6 +1568,44 @@ export function setModelConfig(
     content = content.replace(streamingRegex, "$1true");
   }
 
+  // Mirror the per-model context-window override into `model.context_length`,
+  // which both the desktop context gauge and the agent's auto-compaction
+  // threshold read. Skip entirely when `undefined` so existing callers that
+  // don't track it leave any user-set value alone.
+  if (contextLength !== undefined) {
+    if (typeof contextLength === "number" && contextLength > 0) {
+      content = upsertBlockChild(
+        content,
+        "model",
+        "context_length",
+        String(Math.floor(contextLength)),
+        false, // numeric scalar — write unquoted so YAML parses it as a number
+      );
+    } else {
+      content = removeBlockChild(content, "model", "context_length");
+    }
+  }
+
+  // Mirror the activated model's API-protocol override into `model.api_mode`.
+  // This MUST be rewritten on every switch: the gateway honors a persisted
+  // `model.api_mode` for custom/compatible providers, so a value left behind
+  // by a previously-active model would route the new endpoint over the wrong
+  // protocol — e.g. switching from an Anthropic-compatible endpoint
+  // (api_mode: anthropic_messages) to an OpenAI-compatible one would keep
+  // hitting /v1/messages and 404 / drop the connection (fathah/hermes-desktop
+  // — "connection lost switching OpenAI- and Anthropic-compatible models").
+  // Skip when `undefined` so callers that don't track it leave any user-set
+  // value alone; a non-empty string sets it; `null`/empty removes it so the
+  // agent auto-detects the transport from `base_url` again.
+  if (apiMode !== undefined) {
+    const trimmedMode = (apiMode || "").trim();
+    if (trimmedMode) {
+      content = upsertBlockChild(content, "model", "api_mode", trimmedMode);
+    } else {
+      content = removeBlockChild(content, "model", "api_mode");
+    }
+  }
+
   safeWriteFile(configFile, content);
 }
 
@@ -795,42 +1614,320 @@ export function getHermesHome(profile?: string): string {
 }
 
 /**
+ * `${providerId}:${profile}` pairs already warned about an unresolved
+ * API_SERVER_KEY — one diagnostic line per pair for the whole session, not one
+ * per chat message (getApiServerKey is a hot path).
+ */
+const warnedUnresolvedApiKey = new Set<string>();
+
+/**
  * Resolve the API server's shared secret. Honoured by the local hermes
- * gateway (api_server.token in config.yaml / API_SERVER_KEY in .env) when
- * present; the desktop must include it as `Authorization: Bearer …` on
- * every chat request, otherwise the gateway responds with "Invalid API
- * key".
+ * gateway (`api_server.token` in `config.yaml` / `API_SERVER_KEY` in
+ * `.env`) when present; the desktop must include it as
+ * `Authorization: Bearer …` on every chat request, otherwise the gateway
+ * responds with "Invalid API key" / "Session continuation requires API
+ * key authentication".
  *
- * Search order: profile's config.yaml → default config.yaml → profile's
- * .env → default .env. Returns "" when none configured.
+ * Search order — explicit overrides first, canonical locations after:
+ *
+ *   1. Profile `config.yaml` top-level `API_SERVER_KEY` (legacy override)
+ *   2. Default `config.yaml` top-level `API_SERVER_KEY` (legacy override)
+ *   3. Profile `.env` `API_SERVER_KEY` (matches what the gateway reads)
+ *   4. Default `.env` `API_SERVER_KEY`
+ *   5. Profile `config.yaml` `api_server.token` (canonical hermes-agent
+ *      gateway-secret location — issue #333)
+ *   6. Default `config.yaml` `api_server.token`
+ *
+ * The `api_server.token` candidates are the bug fix for #333: users who
+ * ran `hermes setup` (which writes `api_server.token` into `config.yaml`
+ * but does not touch `.env`) would otherwise see chat fail on the
+ * second message with *"Session continuation requires API key
+ * authentication. Configure API_SERVER_KEY to enable this feature."*
+ *
+ * `.env` is checked **before** `api_server.token` so that the
+ * documented manual workaround — add `API_SERVER_KEY=…` to `.env` to
+ * unblock the second message — still takes precedence when a user has
+ * set it explicitly.
+ *
+ * Returns "" when none of the six locations are configured.
  *
  * Hot path: called per chat message and per error-probe. Reuse the same
- * 5s TTL cache as readEnv() so we don't re-parse config.yaml + .env
- * every call. Invalidated by setEnvValue / setConfigValue when the key
- * being written is API_SERVER_KEY.
+ * 5s TTL cache as `readEnv()` so we do not re-parse `config.yaml` +
+ * `.env` every call. Invalidated by `setEnvValue` / `setConfigValue`
+ * when the key being written is `API_SERVER_KEY` or any
+ * `api_server.*` subkey.
  */
 export function getApiServerKey(profile?: string): string {
   const cacheKey = `apiServerKey:${profile || "default"}`;
   const cached = getCached<string>(cacheKey);
   if (cached !== undefined) return cached;
 
-  const candidates = [
-    getConfigValue("API_SERVER_KEY", profile),
-    profile && profile !== "default" ? getConfigValue("API_SERVER_KEY") : null,
-    readEnv(profile).API_SERVER_KEY || null,
-    profile && profile !== "default" ? readEnv().API_SERVER_KEY || null : null,
-  ];
+  // Overlay the secrets provider's enumerable map BENEATH the `.env` file view,
+  // mirroring the process.env > .env > provider resolution order used
+  // everywhere else: a key is filled from the provider only when neither the
+  // `.env` file nor process.env already has it. A no-op for the default env
+  // provider (its list() IS the `.env` map); for a `command`-provider user this
+  // is what lets a vault-stored API_SERVER_KEY reach the 6-source resolver (as
+  // its canonical `envProfile` arm — deliberately NOT a 7th source, so the
+  // env-provider resolve-precedence policy is unchanged). Copy before
+  // overlaying: readEnv() returns a shared cached object that must not be
+  // mutated with provider values.
+  const envForProfile: Record<string, string> = { ...readEnv(profile) };
+  let providerId = "env";
+  try {
+    providerId = getSecretsProvider(profile).id;
+    let contributed = 0;
+    for (const [k, v] of Object.entries(providerListSafe(profile))) {
+      if (v && !envForProfile[k] && !(process.env[k] ?? "").trim()) {
+        envForProfile[k] = v;
+        contributed++;
+      }
+    }
+    // Visible under --enable-logging so an overlay user can see it happening.
+    console.debug(
+      `[secrets] API_SERVER_KEY overlay: provider=${providerId}, contributed ${contributed} keys`,
+    );
+  } catch {
+    // secrets module not available — fall through to the env-only view
+  }
+  const sources: ApiKeySources = {
+    configTopLevelProfile: getConfigValue("API_SERVER_KEY", profile),
+    configTopLevelDefault:
+      profile && profile !== "default"
+        ? getConfigValue("API_SERVER_KEY")
+        : null,
+    // Prefer the .env file value, then a runtime-injected one (e.g. a vault that
+    // unseals API_SERVER_KEY into the process environment rather than writing it
+    // to .env). This is the env arm of the secrets-provider resolution order.
+    envProfile:
+      envForProfile.API_SERVER_KEY ?? process.env.API_SERVER_KEY ?? null,
+    envDefault:
+      profile && profile !== "default"
+        ? (readEnv().API_SERVER_KEY ?? null)
+        : null,
+    apiServerTokenProfile: getConfigValue("api_server.token", profile),
+    apiServerTokenDefault:
+      profile && profile !== "default"
+        ? getConfigValue("api_server.token")
+        : null,
+  };
+  const { value, source } = resolveApiServerKeyWithSource(sources);
 
-  let value = "";
-  for (const candidate of candidates) {
-    const trimmed = String(candidate || "").trim();
-    if (trimmed) {
-      value = trimmed;
-      break;
+  // Diagnostic for "why is the key missing": one line naming the active
+  // provider, rate-limited per (provider, profile) so the hot path can't spam.
+  if (!value) {
+    const warnKey = `${providerId}:${profile || "default"}`;
+    if (!warnedUnresolvedApiKey.has(warnKey)) {
+      warnedUnresolvedApiKey.add(warnKey);
+      console.warn(
+        `[secrets] API_SERVER_KEY not resolved (provider=${providerId}, env=${profile || "default"})`,
+      );
     }
   }
+
+  // Migration on read — if we resolved the key from a non-canonical
+  // location AND the canonical `.env` slot is empty for this profile,
+  // copy the value into `.env`. Keeps the original copy alone (additive
+  // only — never deletes), so a user who explicitly wrote to
+  // `api_server.token:` can still see their original entry there.
+  //
+  // The point of the migration is to make the gateway's own
+  // `os.getenv("API_SERVER_KEY")` lookup find the value: the gateway's
+  // env hydration at spawn time also injects it (Piece 0), but a
+  // user-edited `.env` is the canonical, file-of-record storage.
+  //
+  // Per-profile scope: cross-profile migration (e.g. copy default .env
+  // value into a profile that has neither) is out of scope — a user
+  // running multiple profiles may have intentionally per-profile keys.
+  const isNamedProfile = Boolean(profile && profile !== "default");
+  const sourceBelongsToProfile =
+    !isNamedProfile ||
+    source === "configTopLevelProfile" ||
+    source === "apiServerTokenProfile";
+  if (
+    value &&
+    source &&
+    sourceBelongsToProfile &&
+    !CANONICAL_API_KEY_SOURCES.has(source) &&
+    !(envForProfile.API_SERVER_KEY ?? "").trim()
+  ) {
+    try {
+      setEnvValue("API_SERVER_KEY", value, profile);
+      appendConfigFixLog({
+        ts: Date.now(),
+        issueCode: "API_SERVER_KEY_NON_CANONICAL",
+        action: "migrate",
+        from: source,
+        to:
+          profile && profile !== "default"
+            ? `~/.hermes/profiles/${profile}/.env`
+            : "~/.hermes/.env",
+        profile: profile || "default",
+        valueMasked: maskKey(value),
+      });
+    } catch {
+      // best-effort — don't block the read on a failed migration
+    }
+  }
+
   setCache(cacheKey, value);
   return value;
+}
+
+/**
+ * Wire shape of the `get-api-server-key-status` IPC channel. `hasKey` is the
+ * stable, required field existing renderer code relies on; `providerId` and
+ * `checkedAt` are ADDITIVE optional extras so a follow-up Settings/Gateway UI
+ * can distinguish "key resolved via vault" vs ".env" vs "missing".
+ */
+export interface ApiServerKeyStatus {
+  hasKey: boolean;
+  providerId?: string;
+  checkedAt?: number;
+}
+
+export function getApiServerKeyStatus(profile?: string): ApiServerKeyStatus {
+  const key = getApiServerKey(profile);
+  const status: ApiServerKeyStatus = { hasKey: key.length > 0 };
+  try {
+    const providerId = getSecretsProvider(profile).id;
+    if (providerId !== undefined) status.providerId = providerId;
+  } catch {
+    // secrets module unavailable — keep the legacy hasKey-only shape
+  }
+  status.checkedAt = Date.now();
+  return status;
+}
+
+/**
+ * Identifies which of the six candidate locations a resolved
+ * `API_SERVER_KEY` was sourced from. Used by the migration-on-read
+ * heuristic in `getApiServerKey` and by the config-health audit to
+ * surface keys living outside the canonical `.env` location.
+ */
+export type ApiKeySource =
+  | "configTopLevelProfile"
+  | "configTopLevelDefault"
+  | "envProfile"
+  | "envDefault"
+  | "apiServerTokenProfile"
+  | "apiServerTokenDefault";
+
+export interface ApiKeySources {
+  configTopLevelProfile: string | null;
+  configTopLevelDefault: string | null;
+  envProfile: string | null;
+  envDefault: string | null;
+  apiServerTokenProfile: string | null;
+  apiServerTokenDefault: string | null;
+}
+
+export interface ApiKeyResolution {
+  value: string;
+  source: ApiKeySource | null;
+}
+
+/**
+ * Source-aware variant of `resolveApiServerKey`. Returns both the
+ * resolved value and a tag indicating which candidate won, so callers
+ * can decide whether the value lives in the canonical `.env` location
+ * or somewhere that warrants a migration / health-audit warning.
+ */
+export function resolveApiServerKeyWithSource(
+  sources: ApiKeySources,
+): ApiKeyResolution {
+  const order: Array<{ source: ApiKeySource; value: string | null }> = [
+    { source: "configTopLevelProfile", value: sources.configTopLevelProfile },
+    { source: "configTopLevelDefault", value: sources.configTopLevelDefault },
+    { source: "envProfile", value: sources.envProfile },
+    { source: "envDefault", value: sources.envDefault },
+    { source: "apiServerTokenProfile", value: sources.apiServerTokenProfile },
+    { source: "apiServerTokenDefault", value: sources.apiServerTokenDefault },
+  ];
+  for (const { source, value } of order) {
+    const trimmed = String(value ?? "").trim();
+    if (trimmed) return { value: trimmed, source };
+  }
+  return { value: "", source: null };
+}
+
+/**
+ * Pure precedence-resolution for the API server's shared secret. Split
+ * out from `getApiServerKey` so the candidate-ordering policy can be
+ * unit-tested without filesystem fixtures (the I/O — `getConfigValue` /
+ * `readEnv` — happens in the caller).
+ *
+ * Returns the first non-empty trimmed candidate, or "" when all six
+ * sources are empty / null / whitespace.
+ */
+export function resolveApiServerKey(sources: ApiKeySources): string {
+  return resolveApiServerKeyWithSource(sources).value;
+}
+
+/**
+ * Sources that are considered the canonical location for
+ * `API_SERVER_KEY`. Reads from anywhere else are still honoured but
+ * trigger a migration write to `.env` (see Piece 1) so future reads —
+ * and crucially the gateway's own `os.getenv("API_SERVER_KEY")` —
+ * find the value in the canonical spot.
+ */
+export const CANONICAL_API_KEY_SOURCES: ReadonlySet<ApiKeySource> =
+  new Set<ApiKeySource>(["envProfile", "envDefault"]);
+
+/**
+ * Mask a credential for safe logging: keep the first 4 and last 4
+ * characters, replace the middle with a fixed-width ellipsis. Returns
+ * "" for empty input and "***" for very short values where masking
+ * would still expose most of the key.
+ */
+export function maskKey(value: string): string {
+  if (!value) return "";
+  if (value.length <= 8) return "***";
+  return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+/**
+ * Append a JSONL entry to `~/.hermes/logs/config-fixes.log` recording
+ * an automated or user-initiated config migration. Auto-truncates the
+ * log to the most-recent 1000 entries on each write so it doesn't grow
+ * unbounded. Best-effort — any I/O error is silently swallowed so a
+ * broken log directory never blocks the migration itself.
+ */
+export interface ConfigFixLogEntry {
+  ts: number;
+  issueCode: string;
+  action: "migrate" | "autofix" | "manual-fix";
+  from?: string;
+  to?: string;
+  profile?: string;
+  valueMasked?: string;
+  detail?: string;
+}
+
+const CONFIG_FIX_LOG_MAX_LINES = 1000;
+
+export function appendConfigFixLog(entry: ConfigFixLogEntry): void {
+  try {
+    const logDir = join(HERMES_HOME, "logs");
+    if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+    const logFile = join(logDir, "config-fixes.log");
+    let existing = "";
+    if (existsSync(logFile)) {
+      existing = readFileSync(logFile, "utf-8");
+      const lines = existing.split("\n").filter((l) => l.trim() !== "");
+      if (lines.length >= CONFIG_FIX_LOG_MAX_LINES) {
+        existing =
+          lines.slice(lines.length - CONFIG_FIX_LOG_MAX_LINES + 1).join("\n") +
+          "\n";
+      } else if (existing && !existing.endsWith("\n")) {
+        existing += "\n";
+      }
+    }
+    const line = JSON.stringify(entry) + "\n";
+    writeFileSync(logFile, existing + line, "utf-8");
+  } catch {
+    // intentionally silent — never let log I/O block a migration
+  }
 }
 
 // ── Platform enabled/disabled ─────────────────────────────
@@ -859,22 +1956,93 @@ const TRUTHY_VALUES = new Set(["true", "1", "yes", "on"]);
 const PLATFORM_RULES: Record<string, PlatformRule> = {
   telegram: { envCheck: (e) => !!e.TELEGRAM_BOT_TOKEN?.trim() },
   discord: { envCheck: (e) => !!e.DISCORD_BOT_TOKEN?.trim() },
-  slack: { envCheck: (e) => !!e.SLACK_BOT_TOKEN?.trim() },
+  slack: {
+    envCheck: (e) => !!e.SLACK_BOT_TOKEN?.trim() && !!e.SLACK_APP_TOKEN?.trim(),
+  },
   whatsapp: {
     envCheck: (e) =>
-      TRUTHY_VALUES.has((e.WHATSAPP_ENABLED || "").trim().toLowerCase()),
+      TRUTHY_VALUES.has((e.WHATSAPP_ENABLED || "").trim().toLowerCase()) ||
+      (!!e.WHATSAPP_API_URL?.trim() && !!e.WHATSAPP_API_TOKEN?.trim()),
   },
   signal: {
-    envCheck: (e) => !!e.SIGNAL_HTTP_URL?.trim() && !!e.SIGNAL_ACCOUNT?.trim(),
+    envCheck: (e) =>
+      (!!e.SIGNAL_HTTP_URL?.trim() && !!e.SIGNAL_ACCOUNT?.trim()) ||
+      !!e.SIGNAL_PHONE_NUMBER?.trim(),
   },
   matrix: {
     envCheck: (e) =>
-      !!e.MATRIX_ACCESS_TOKEN?.trim() || !!e.MATRIX_PASSWORD?.trim(),
+      (!!e.MATRIX_HOMESERVER?.trim() &&
+        !!e.MATRIX_ACCESS_TOKEN?.trim() &&
+        !!e.MATRIX_USER_ID?.trim()) ||
+      !!e.MATRIX_PASSWORD?.trim(),
   },
-  mattermost: { envCheck: (e) => !!e.MATTERMOST_TOKEN?.trim() },
+  mattermost: {
+    envCheck: (e) => !!e.MATTERMOST_URL?.trim() && !!e.MATTERMOST_TOKEN?.trim(),
+  },
   home_assistant: {
-    envCheck: (e) => !!e.HASS_TOKEN?.trim(),
+    envCheck: (e) => !!e.HASS_URL?.trim() && !!e.HASS_TOKEN?.trim(),
     configKey: "homeassistant",
+  },
+  homeassistant: {
+    envCheck: (e) => !!e.HASS_URL?.trim() && !!e.HASS_TOKEN?.trim(),
+    configKey: "homeassistant",
+  },
+  email: {
+    envCheck: (e) =>
+      !!e.EMAIL_ADDRESS?.trim() &&
+      !!e.EMAIL_PASSWORD?.trim() &&
+      (!!e.EMAIL_IMAP_HOST?.trim() || !!e.EMAIL_IMAP_SERVER?.trim()) &&
+      (!!e.EMAIL_SMTP_HOST?.trim() || !!e.EMAIL_SMTP_SERVER?.trim()),
+  },
+  sms: {
+    envCheck: (e) =>
+      !!e.TWILIO_ACCOUNT_SID?.trim() && !!e.TWILIO_AUTH_TOKEN?.trim(),
+  },
+  bluebubbles: {
+    envCheck: (e) =>
+      (!!e.BLUEBUBBLES_SERVER_URL?.trim() || !!e.BLUEBUBBLES_URL?.trim()) &&
+      !!e.BLUEBUBBLES_PASSWORD?.trim(),
+  },
+  dingtalk: {
+    envCheck: (e) =>
+      (!!e.DINGTALK_CLIENT_ID?.trim() && !!e.DINGTALK_CLIENT_SECRET?.trim()) ||
+      (!!e.DINGTALK_APP_KEY?.trim() && !!e.DINGTALK_APP_SECRET?.trim()),
+  },
+  feishu: {
+    envCheck: (e) => !!e.FEISHU_APP_ID?.trim() && !!e.FEISHU_APP_SECRET?.trim(),
+  },
+  wecom: {
+    envCheck: (e) =>
+      !!e.WECOM_BOT_ID?.trim() ||
+      (!!e.WECOM_CORP_ID?.trim() &&
+        !!e.WECOM_AGENT_ID?.trim() &&
+        !!e.WECOM_SECRET?.trim()),
+  },
+  wecom_callback: {
+    envCheck: (e) =>
+      !!e.WECOM_CALLBACK_CORP_ID?.trim() &&
+      !!e.WECOM_CALLBACK_CORP_SECRET?.trim() &&
+      !!e.WECOM_CALLBACK_AGENT_ID?.trim(),
+  },
+  weixin: {
+    envCheck: (e) =>
+      (!!e.WEIXIN_ACCOUNT_ID?.trim() && !!e.WEIXIN_TOKEN?.trim()) ||
+      !!e.WEIXIN_BOT_TOKEN?.trim(),
+  },
+  qqbot: {
+    envCheck: (e) => !!e.QQ_APP_ID?.trim() && !!e.QQ_CLIENT_SECRET?.trim(),
+  },
+  yuanbao: { envCheck: () => false },
+  api_server: {
+    envCheck: (e) =>
+      TRUTHY_VALUES.has((e.API_SERVER_ENABLED || "").trim().toLowerCase()) ||
+      !!e.API_SERVER_KEY?.trim(),
+  },
+  webhook: {
+    envCheck: (e) =>
+      TRUTHY_VALUES.has((e.WEBHOOK_ENABLED || "").trim().toLowerCase()) ||
+      !!e.WEBHOOK_SECRET?.trim(),
+    configKey: "webhook",
   },
 };
 
@@ -889,29 +2057,23 @@ const SUPPORTED_PLATFORMS = Object.keys(PLATFORM_RULES);
  *       allowed_chats: ''
  *
  * Returns true/false if found, null if absent. The block must start at
- * column 0; `enabled:` is captured if it sits anywhere inside the
- * contiguous indented sub-block (any depth, in any position).
+ * column 0 and `enabled:` must be one of its direct children.
  */
 function readPlatformOverride(
   content: string,
   platform: string,
 ): boolean | null {
-  const blockStartRe = new RegExp(
-    `^${escapeRegex(platform)}:[ \\t]*\\r?\\n`,
-    "m",
-  );
-  const startMatch = content.match(blockStartRe);
-  if (!startMatch || startMatch.index === undefined) return null;
-
-  const after = content.slice(startMatch.index + startMatch[0].length);
-  const lines = after.split(/\r?\n/);
-  for (const line of lines) {
-    if (line.trim() === "") continue;
-    if (!/^\s/.test(line)) break; // hit next top-level key
-    const m = line.match(/^[ \t]+enabled:[ \t]*(true|false)\b/);
-    if (m) return m[1] === "true";
-  }
+  const value = readTopLevelBlock(content, platform).children.get(
+    "enabled",
+  )?.value;
+  if (value === "true") return true;
+  if (value === "false") return false;
   return null;
+}
+
+function configLineEnding(content: string): "\r\n" | "\n" {
+  const firstNewline = content.indexOf("\n");
+  return firstNewline > 0 && content[firstNewline - 1] === "\r" ? "\r\n" : "\n";
 }
 
 export function getPlatformEnabled(profile?: string): Record<string, boolean> {
@@ -927,10 +2089,6 @@ export function getPlatformEnabled(profile?: string): Record<string, boolean> {
     const envEnabled = rule.envCheck(env);
     const configKey = rule.configKey || platform;
     const override = content ? readPlatformOverride(content, configKey) : null;
-    // Python's rule: env-driven activation, config.yaml `enabled: false`
-    // can force-disable. An explicit `enabled: true` doesn't bypass a
-    // missing token (the Python gateway still requires the credential),
-    // so reflect that here too.
     result[platform] = envEnabled && override !== false;
   }
   return result;
@@ -972,90 +2130,56 @@ export function setPlatformEnabled(
   }
 
   let content = readFileSync(configFile, "utf-8");
-  const enabledLineRe = new RegExp(
-    `^([ \\t]+enabled:[ \\t]*)(true|false)\\b([ \\t]*)$`,
-    "m",
-  );
-  const blockStartRe = new RegExp(
-    `^(${escapeRegex(configKey)}:[ \\t]*\\r?\\n)`,
-    "m",
-  );
+  const originalContent = content;
+  const lineEnding = configLineEnding(content);
   const flowStyleRe = new RegExp(
-    `^${escapeRegex(configKey)}:[ \\t]*\\{\\s*\\}[ \\t]*$`,
+    `^${escapeRegex(configKey)}:[ \\t]*\\{\\s*\\}[ \\t]*(?=\\r?$)`,
     "m",
   );
 
-  const blockMatch = content.match(blockStartRe);
-  const hasBlock = !!blockMatch;
   const isFlowEmpty = flowStyleRe.test(content);
 
   if (isFlowEmpty) {
+    if (enabled) return;
     // Convert `<platform>: {}` to a block we can edit.
     content = content.replace(
       flowStyleRe,
-      `${configKey}:\n  enabled: ${enabled}`,
+      `${configKey}:${lineEnding}  enabled: false`,
     );
     safeWriteFile(configFile, content);
     return;
   }
 
-  if (hasBlock && blockMatch?.index !== undefined) {
-    const blockStart = blockMatch.index + blockMatch[0].length;
-    const rest = content.slice(blockStart);
-    const restLines = rest.split(/\r?\n/);
+  const { children, blockBodyStart, childIndent } = readTopLevelBlock(
+    content,
+    configKey,
+  );
+  const existing = children.get("enabled");
 
-    // Find the extent of the platform's sub-block (indented children).
-    let subBlockEndOffset = 0;
-    let existingEnabledLineStart: number | null = null;
-    let existingEnabledLineEnd: number | null = null;
-    for (const line of restLines) {
-      const lineLen = line.length + 1; // include trailing \n
-      if (line.trim() === "") {
-        subBlockEndOffset += lineLen;
-        continue;
-      }
-      if (!/^\s/.test(line)) break;
-      const localStart = blockStart + subBlockEndOffset;
-      const enabledMatch = line.match(enabledLineRe);
-      if (enabledMatch) {
-        existingEnabledLineStart = localStart;
-        existingEnabledLineEnd = localStart + line.length;
-      }
-      subBlockEndOffset += lineLen;
-    }
-
-    if (existingEnabledLineStart !== null && existingEnabledLineEnd !== null) {
-      if (enabled) {
-        // Remove the entire `  enabled: false` line, including its newline.
-        const removeEnd =
-          content[existingEnabledLineEnd] === "\n"
-            ? existingEnabledLineEnd + 1
-            : existingEnabledLineEnd;
-        content =
-          content.slice(0, existingEnabledLineStart) + content.slice(removeEnd);
-      } else {
-        content =
-          content.slice(0, existingEnabledLineStart) +
-          `  enabled: false` +
-          content.slice(existingEnabledLineEnd);
-      }
-    } else if (!enabled) {
-      // Append `enabled: false` as the first child of the block.
+  if (blockBodyStart !== null) {
+    if (existing && enabled) {
+      content = removeBlockChild(content, configKey, "enabled");
+    } else if (existing && !enabled && existing.value !== "false") {
       content =
-        content.slice(0, blockStart) +
-        `  enabled: false\n` +
-        content.slice(blockStart);
+        content.slice(0, existing.valueStart) +
+        "false" +
+        content.slice(existing.valueEnd);
+    } else if (!existing && !enabled) {
+      content =
+        content.slice(0, blockBodyStart) +
+        `${childIndent}enabled: false${lineEnding}` +
+        content.slice(blockBodyStart);
     }
-    // (enabled=true with no existing override: nothing to do.)
 
-    safeWriteFile(configFile, content);
+    if (content !== originalContent) safeWriteFile(configFile, content);
     return;
   }
 
   // No block at all — only need to materialize one when recording a disable.
   if (!enabled) {
-    const trailingNewline = content.endsWith("\n") ? "" : "\n";
-    content += `${trailingNewline}${configKey}:\n  enabled: false\n`;
+    const separator =
+      content === "" || content.endsWith("\n") ? "" : lineEnding;
+    content += `${separator}${configKey}:${lineEnding}  enabled: false${lineEnding}`;
     safeWriteFile(configFile, content);
   }
 }
@@ -1066,12 +2190,36 @@ function authFilePath(profile?: string): string {
   return join(profileHome(profile || getActiveProfileNameSync()), "auth.json");
 }
 
+/**
+ * Shape of a credential-pool entry as the upstream gateway expects it.
+ *
+ * The engine's resolver (`hermes_cli/auth.py` and the credential-pool
+ * entry parser) reads `access_token` (not `key`), needs an
+ * `auth_type` to distinguish OAuth from API-key entries inside the
+ * same pool, and uses `id` / `priority` / `source` for rotation and
+ * telemetry. Issue #367 — pool entries written by the desktop with
+ * just `{key, label}` were rejected at runtime ("Hermes is not
+ * logged into Nous Portal") because none of the canonical fields
+ * were present.
+ *
+ * `key` is retained for read-only compatibility — old auth.json files
+ * that already contain `{key, label}` entries are still parsed
+ * (otherwise a user's existing manual entries would vanish on first
+ * read). New writes always use the full canonical shape.
+ */
 interface CredentialEntry {
-  key?: string;
-  api_key?: string;
+  id?: string;
+  label?: string;
+  auth_type?: "api_key" | "oauth_device_code" | string;
+  priority?: number;
+  source?: string;
   access_token?: string;
   refresh_token?: string;
-  label?: string;
+  api_key?: string;
+  base_url?: string;
+  request_count?: number;
+  /** Legacy field — historical pool entries written with `{key, label}`. */
+  key?: string;
 }
 
 function readAuthStore(profile?: string): Record<string, unknown> {
@@ -1112,6 +2260,70 @@ export function setCredentialPool(
   (store.credential_pool as Record<string, CredentialEntry[]>)[provider] =
     entries;
   writeAuthStore(store, profile);
+}
+
+/**
+ * Build a credential-pool entry in the canonical engine shape from a
+ * user-typed (key, label). Used by the Providers screen so the
+ * renderer doesn't need to know the upstream schema — issue #367.
+ *
+ * The base URL for known providers comes from `canonicalProviderBaseUrl`;
+ * unknown providers (`custom`, user-defined) get an empty `base_url`
+ * and the engine falls back to its own registry.
+ */
+export function buildCredentialPoolEntry(
+  provider: string,
+  apiKey: string,
+  label: string,
+  existingEntries: CredentialEntry[] = [],
+): CredentialEntry {
+  const baseUrl = canonicalProviderBaseUrl(provider) || "";
+  // Next priority — pool entries are sorted ascending, so a new entry
+  // appended at the end gets the highest priority value.
+  const nextPriority = existingEntries.reduce(
+    (max, e) =>
+      typeof e.priority === "number" ? Math.max(max, e.priority + 1) : max,
+    0,
+  );
+  return {
+    id: cryptoRandomId(),
+    label: label.trim() || `Key ${existingEntries.length + 1}`,
+    auth_type: "api_key",
+    priority: nextPriority,
+    source: "manual",
+    access_token: apiKey.trim(),
+    base_url: baseUrl,
+    request_count: 0,
+  };
+}
+
+function cryptoRandomId(): string {
+  // 8-hex-char id — matches the existing pool entries' id length.
+  // Uses `randomBytes(4)` so the name finally matches the impl: four
+  // cryptographically-strong bytes → 8 hex chars. Post-#382 review
+  // feedback flagged the previous `Math.random()` loop as both
+  // misleadingly named and collision-prone at scale.
+  return randomBytes(4).toString("hex");
+}
+
+/**
+ * Append a manually-typed credential pool entry, constructing the
+ * full canonical shape. Used by the renderer's "Add" button so the
+ * shape stays consistent with what the engine's resolver expects.
+ *
+ * Returns the updated entries list for that provider.
+ */
+export function addCredentialPoolEntry(
+  provider: string,
+  apiKey: string,
+  label: string,
+  profile?: string,
+): CredentialEntry[] {
+  const existing = getCredentialPool(profile)[provider] || [];
+  const entry = buildCredentialPoolEntry(provider, apiKey, label, existing);
+  const next = [...existing, entry];
+  setCredentialPool(provider, next, profile);
+  return next;
 }
 
 /**

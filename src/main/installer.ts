@@ -1,27 +1,60 @@
+import type { InstallProgress } from "../shared/update-progress";
+export type { InstallProgress } from "../shared/update-progress";
+import { verifiedWindowsInstallerScript } from "./installer-windows-download";
+import { discoverMemoryProviderDirectories } from "./memory-provider-discovery";
+import { getYamlPath } from "./yaml-path";
+import { buildInstallErrorMessage } from "./installer-errors";
 import { spawn, execFile, execFileSync } from "child_process";
 import {
   existsSync,
   readFileSync,
   readdirSync,
+  statSync,
   writeFileSync,
   unlinkSync,
 } from "fs";
-import { join, delimiter } from "path";
+import { join, delimiter, resolve, basename } from "path";
 import { homedir, tmpdir } from "os";
-import { randomBytes } from "crypto";
-import type { BrowserWindow } from "electron";
+import { createHash, randomBytes } from "crypto";
+import {
+  app,
+  dialog,
+  type BrowserWindow,
+  type MessageBoxOptions,
+} from "electron";
 import {
   getConnectionConfig,
   getModelConfig,
   hasOAuthCredentials,
 } from "./config";
 import { providerDoesNotNeedApiKey } from "./providers";
-import { getActiveProfileNameSync, profileHome, stripAnsi } from "./utils";
+import {
+  getActiveProfileNameSync,
+  isValidProfileName,
+  PROFILE_NAME_ERROR,
+  profileHome,
+  stripAnsi,
+} from "./utils";
 import { setupAskpass, AskpassHandle } from "./askpass";
 import { precacheSudoCredentials } from "./sudoCreds";
 import { HIDDEN_SUBPROCESS_OPTIONS } from "./process-options";
+import { matchesProviderUrl } from "../shared/url-key-map";
+import {
+  INSTALLER_VERIFICATION_FAILED,
+  verifiedInstallerCommand,
+} from "./installer-download";
 
 const IS_WINDOWS = process.platform === "win32";
+
+const HERMES_DESKTOP_USER_DATA_DIR =
+  process.env.HERMES_DESKTOP_USER_DATA_DIR?.trim();
+if (HERMES_DESKTOP_USER_DATA_DIR) {
+  try {
+    app.setPath("userData", HERMES_DESKTOP_USER_DATA_DIR);
+  } catch {
+    /* best effort: Electron may reject late path changes in tests */
+  }
+}
 
 // Resolve the Hermes data directory. Precedence:
 //   1. HERMES_HOME env var if set (install.ps1 sets it User-scope on
@@ -66,12 +99,116 @@ function defaultHermesHome(): string {
   return localApp ?? homeDot;
 }
 
+// A Hermes home the user explicitly pointed the app at via the "use an
+// existing installation" flow (issue #272). Persisted in the desktop's own
+// userData dir — outside any Hermes home — so it can be read here, before
+// HERMES_HOME is resolved. When the selection replaces an inherited
+// HERMES_HOME, remember a one-way fingerprint of that exact value so the same
+// launch environment cannot mask the user's choice again after restart. A
+// different later HERMES_HOME remains authoritative.
+function hermesHomeOverrideFile(): string {
+  // `app` is undefined outside an Electron runtime (e.g. unit tests) —
+  // optional-chain it so module load degrades to "no override" instead of
+  // throwing.
+  const userData = app?.getPath?.("userData");
+  return userData ? join(userData, "hermes-home.json") : "";
+}
+
+const inheritedHermesHome = process.env.HERMES_HOME?.trim() || "";
+
+interface StoredHermesHomeOverride {
+  hermesHome: string;
+  shadowedHermesHomeHash?: string;
+}
+
+function normalizedHomePath(home: string): string {
+  const normalized = resolve(home);
+  return IS_WINDOWS ? normalized.toLowerCase() : normalized;
+}
+
+function sameHomePath(left: string, right: string): boolean {
+  return normalizedHomePath(left) === normalizedHomePath(right);
+}
+
+function homePathFingerprint(home: string): string {
+  return createHash("sha256").update(normalizedHomePath(home)).digest("hex");
+}
+
+function readHermesHomeOverride(): StoredHermesHomeOverride | null {
+  try {
+    const file = hermesHomeOverrideFile();
+    if (!file || !existsSync(file)) return null;
+    const parsed = JSON.parse(readFileSync(file, "utf-8")) as {
+      hermesHome?: unknown;
+      shadowedHermesHomeHash?: unknown;
+    };
+    const hermesHome =
+      typeof parsed.hermesHome === "string" ? parsed.hermesHome.trim() : "";
+    // Ignore an override whose desktop-compatible installation is stale or incomplete.
+    if (!hermesHome || !validateHermesHome(hermesHome)) return null;
+    const shadowedHermesHomeHash =
+      typeof parsed.shadowedHermesHomeHash === "string"
+        ? parsed.shadowedHermesHomeHash.trim()
+        : "";
+    return {
+      hermesHome,
+      ...(/^[a-f0-9]{64}$/.test(shadowedHermesHomeHash)
+        ? { shadowedHermesHomeHash }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist (when `home` is set) or clear (when "") the Hermes home override. */
+export function setHermesHomeOverride(home: string): void {
+  try {
+    const file = hermesHomeOverrideFile();
+    if (!file) return;
+    const hermesHome = home.trim();
+    if (!hermesHome) {
+      if (existsSync(file)) unlinkSync(file);
+      return;
+    }
+    const stored: StoredHermesHomeOverride = { hermesHome };
+    if (inheritedHermesHome && !sameHomePath(inheritedHermesHome, hermesHome)) {
+      stored.shadowedHermesHomeHash = homePathFingerprint(inheritedHermesHome);
+    }
+    writeFileSync(file, JSON.stringify(stored, null, 2), "utf-8");
+  } catch {
+    /* best effort — a failed write just means no override next launch */
+  }
+}
+
+const storedHermesHome = readHermesHomeOverride();
+const storedHomeShadowsInherited = Boolean(
+  inheritedHermesHome &&
+  storedHermesHome?.shadowedHermesHomeHash &&
+  homePathFingerprint(inheritedHermesHome) ===
+    storedHermesHome.shadowedHermesHomeHash,
+);
+
 export const HERMES_HOME =
-  process.env.HERMES_HOME?.trim() || defaultHermesHome();
+  (storedHomeShadowsInherited ? storedHermesHome?.hermesHome : "") ||
+  inheritedHermesHome ||
+  storedHermesHome?.hermesHome ||
+  defaultHermesHome();
 export const HERMES_REPO = join(HERMES_HOME, "hermes-agent");
 export const HERMES_VENV = join(HERMES_REPO, "venv");
+// On Windows, use `pythonw.exe` (the GUI-subsystem interpreter that ships in
+// every venv) instead of `python.exe` so that subprocess spawns don't flash
+// a blank console window before `windowsHide: true` / CREATE_NO_WINDOW takes
+// effect. Issue #342: on every chat send the `sendMessageViaCli` fallback
+// path spawned `python.exe`, and the console appeared for a few hundred ms
+// despite `windowsHide: true` — a well-known race between console allocation
+// and CREATE_NO_WINDOW on console-subsystem child binaries. `pythonw.exe`
+// is linked as Windows subsystem, so the OS can never allocate a console
+// for it regardless of creation flags. It's a bit-identical interpreter
+// otherwise — same modules, same stdout/stderr behaviour over piped stdio
+// (which is what every call site here uses).
 export const HERMES_PYTHON = IS_WINDOWS
-  ? join(HERMES_VENV, "Scripts", "python.exe")
+  ? join(HERMES_VENV, "Scripts", "pythonw.exe")
   : join(HERMES_VENV, "bin", "python");
 export const HERMES_SCRIPT = IS_WINDOWS
   ? join(HERMES_VENV, "Scripts", "hermes.exe")
@@ -80,11 +217,32 @@ export const HERMES_ENV_FILE = join(HERMES_HOME, ".env");
 export const HERMES_CONFIG_FILE = join(HERMES_HOME, "config.yaml");
 export const HERMES_AUTH_FILE = join(HERMES_HOME, "auth.json");
 
+/** The Python + hermes-script paths for a Hermes install rooted at `home`,
+ *  in the layout the desktop's own installer produces. */
+function installBinariesFor(home: string): { python: string; script: string } {
+  const repo = join(home, "hermes-agent");
+  const venv = join(repo, "venv");
+  return IS_WINDOWS
+    ? {
+        python: join(venv, "Scripts", "python.exe"),
+        script: join(venv, "Scripts", "hermes.exe"),
+      }
+    : { python: join(venv, "bin", "python"), script: join(repo, "hermes") };
+}
+
 export function hermesCliArgs(args: string[] = []): string[] {
   if (process.platform === "win32") {
     return ["-m", "hermes_cli.main", ...args];
   }
   return [HERMES_SCRIPT, ...args];
+}
+
+function canInvokeHermesCli(): boolean {
+  if (!existsSync(HERMES_PYTHON)) return false;
+  if (IS_WINDOWS) {
+    return existsSync(join(HERMES_REPO, "hermes_cli", "main.py"));
+  }
+  return existsSync(HERMES_SCRIPT);
 }
 
 export interface InstallStatus {
@@ -93,14 +251,6 @@ export interface InstallStatus {
   hasApiKey: boolean;
   verified: boolean;
   activeProfile?: string;
-}
-
-export interface InstallProgress {
-  step: number;
-  totalSteps: number;
-  title: string;
-  detail: string;
-  log: string;
 }
 
 export function getEnhancedPath(): string {
@@ -208,8 +358,12 @@ function activeAuthFile(profile: string): string {
 // See issue #236.
 const PROVIDER_ENV_KEYS: Record<string, string> = {
   openrouter: "OPENROUTER_API_KEY",
+  "opencode-zen": "OPENCODE_ZEN_API_KEY",
+  "opencode-go": "OPENCODE_GO_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   openai: "OPENAI_API_KEY",
+  "ollama-cloud": "OLLAMA_API_KEY",
+  aimlapi: "AIMLAPI_API_KEY",
   google: "GOOGLE_API_KEY",
   xai: "XAI_API_KEY",
   groq: "GROQ_API_KEY",
@@ -221,28 +375,56 @@ const PROVIDER_ENV_KEYS: Record<string, string> = {
   perplexity: "PERPLEXITY_API_KEY",
   huggingface: "HF_TOKEN",
   hf: "HF_TOKEN",
-  qwen: "QWEN_API_KEY",
+  // DashScope: `alibaba` is the canonical agent slug; the rest are the
+  // agent's own aliases for it (models.py PROVIDER_ALIASES) — including
+  // `qwen`, which every pre-#825 desktop config stored. Only `qwen-oauth`
+  // is the Qwen Portal OAuth provider.
+  alibaba: "DASHSCOPE_API_KEY",
+  dashscope: "DASHSCOPE_API_KEY",
+  qwen: "DASHSCOPE_API_KEY",
+  aliyun: "DASHSCOPE_API_KEY",
+  "alibaba-cloud": "DASHSCOPE_API_KEY",
+  "qwen-oauth": "QWEN_API_KEY",
   minimax: "MINIMAX_API_KEY",
   glm: "GLM_API_KEY",
   kimi: "KIMI_API_KEY",
   nvidia: "NVIDIA_API_KEY",
+  // Nous Portal supports BOTH OAuth (`nous` variant) AND API key
+  // (`nous-api` variant). Register the env var name under both ids so
+  // the install-gate + pre-send validation + config-health audit can
+  // detect a missing key — whichever id the user's profile happens to
+  // be configured under. The OAuth case is handled separately by
+  // checking auth.json via hasOAuthCredentials() (config.ts).
+  nous: "NOUS_API_KEY",
+  "nous-api": "NOUS_API_KEY",
+  xiaomi: "XIAOMI_API_KEY",
 };
 
 // When provider is "custom" or "auto", the desktop's setup flow falls
 // back to recognizing the endpoint by base URL. Same patterns hermes.ts
 // uses for runtime header injection.
-const URL_TO_ENV_KEY: Array<[RegExp, string]> = [
+const URL_TO_ENV_KEY: Array<[RegExp, string, boolean?]> = [
+  // Strict hosts take precedence over legacy URL-substring mappings.
+  [/(?:^|\.)requesty\.ai$/i, "REQUESTY_API_KEY", true],
+  [/^global\.api-route\.com$/i, "API_ROUTE_API_KEY", true],
+  [/^api\.cheaperinference\.com$/i, "CHEAPERINFERENCE_API_KEY", true],
   [/openrouter\.ai/i, "OPENROUTER_API_KEY"],
   [/anthropic\.com/i, "ANTHROPIC_API_KEY"],
   [/openai\.com/i, "OPENAI_API_KEY"],
+  [/(^|\/\/|\.)ollama\.com(?=\/|:|$)/i, "OLLAMA_API_KEY"],
+  [/api\.aimlapi\.com/i, "AIMLAPI_API_KEY"],
   [/huggingface\.co/i, "HF_TOKEN"],
   [/api\.groq\.com/i, "GROQ_API_KEY"],
   [/api\.deepseek\.com/i, "DEEPSEEK_API_KEY"],
   [/api\.together\.xyz/i, "TOGETHER_API_KEY"],
   [/api\.fireworks\.ai/i, "FIREWORKS_API_KEY"],
   [/api\.cerebras\.ai/i, "CEREBRAS_API_KEY"],
+  [/atlascloud\.ai/i, "ATLASCLOUD_API_KEY"],
+  [/api\.novita\.ai/i, "NOVITA_API_KEY"],
   [/api\.mistral\.ai/i, "MISTRAL_API_KEY"],
   [/api\.perplexity\.ai/i, "PERPLEXITY_API_KEY"],
+  [/api\.xiaomimimo\.com/i, "XIAOMI_API_KEY"],
+  [/dashscope(-intl)?\.aliyuncs\.com/i, "DASHSCOPE_API_KEY"],
 ];
 
 /**
@@ -259,8 +441,8 @@ export function expectedEnvKeyForModel(
 ): string | null {
   const direct = PROVIDER_ENV_KEYS[provider.trim().toLowerCase()];
   if (direct) return direct;
-  for (const [pattern, envKey] of URL_TO_ENV_KEY) {
-    if (pattern.test(baseUrl)) return envKey;
+  for (const [pattern, envKey, matchHostname] of URL_TO_ENV_KEY) {
+    if (matchesProviderUrl(baseUrl, pattern, matchHostname)) return envKey;
   }
   return null;
 }
@@ -298,6 +480,54 @@ function envHasUsableValue(
     }
   }
   return false;
+}
+
+// ── Pre-install inspection (issue #272) ──────────────────────────────────────
+
+export type InstallTargetState = "fresh" | "update" | "replace";
+
+export interface InstallTargetInfo {
+  /** Where the desktop will install — shown to the user before they commit. */
+  hermesHome: string;
+  repoPath: string;
+  /** What the installer will do to `repoPath`:
+   *  - `fresh`   — nothing is there; a clean install.
+   *  - `update`  — a valid git checkout; install.sh/ps1 updates it in place.
+   *  - `replace` — a directory is there but not a valid checkout, so the
+   *                install script deletes and re-clones it. */
+  state: InstallTargetState;
+}
+
+/** Classify what the installer will do to the target directory. Pure — the
+ *  filesystem probing lives in `inspectInstallTarget`. */
+export function classifyInstallTarget(
+  repoExists: boolean,
+  repoIsGitRepo: boolean,
+): InstallTargetState {
+  if (!repoExists) return "fresh";
+  return repoIsGitRepo ? "update" : "replace";
+}
+
+/** Inspect the install target so the renderer can warn before installing. */
+export function inspectInstallTarget(): InstallTargetInfo {
+  const repoExists = existsSync(HERMES_REPO);
+  const repoIsGitRepo = repoExists && existsSync(join(HERMES_REPO, ".git"));
+  return {
+    hermesHome: HERMES_HOME,
+    repoPath: HERMES_REPO,
+    state: classifyInstallTarget(repoExists, repoIsGitRepo),
+  };
+}
+
+/** True when `dir` is a Hermes home the desktop can drive as-is — it must
+ *  contain a `hermes-agent` install with the venv binaries in the layout the
+ *  desktop expects. A hand-rolled install with a different layout fails here
+ *  rather than being silently adopted into a broken state (issue #272). */
+export function validateHermesHome(dir: string): boolean {
+  const home = dir?.trim();
+  if (!home || !existsSync(home)) return false;
+  const { python, script } = installBinariesFor(home);
+  return existsSync(python) && existsSync(script);
 }
 
 export function checkInstallStatus(): InstallStatus {
@@ -363,7 +593,7 @@ let _verifyCache: { ok: boolean; ts: number } | null = null;
 const VERIFY_TTL_MS = 5 * 60 * 1000;
 
 export async function verifyInstall(): Promise<boolean> {
-  if (!existsSync(HERMES_PYTHON) || !existsSync(HERMES_SCRIPT)) return false;
+  if (!canInvokeHermesCli()) return false;
   if (_verifyCache && Date.now() - _verifyCache.ts < VERIFY_TTL_MS) {
     return _verifyCache.ok;
   }
@@ -397,12 +627,21 @@ let _versionFetching = false;
 
 export async function getHermesVersion(): Promise<string | null> {
   if (_cachedVersion !== null) return _cachedVersion;
-  if (!existsSync(HERMES_PYTHON) || !existsSync(HERMES_SCRIPT)) return null;
+  if (!canInvokeHermesCli()) return null;
   if (_versionFetching) {
-    // Wait for in-flight fetch
+    // Wait for the in-flight fetch but cap the wait. The execFile below
+    // has a 15s timeout and its callback unconditionally clears
+    // `_versionFetching`, so under normal failure paths the poll
+    // unblocks on its own. Pathological cases (callback never invoked,
+    // worker killed mid-callback, async exception in handler) would
+    // otherwise leak a 100 ms interval per caller forever. Cap at 20s
+    // — comfortably above the execFile timeout — and resolve with
+    // whatever `_cachedVersion` happens to be (typically `null`),
+    // which matches the same return shape callers already handle.
     return new Promise((resolve) => {
+      const startedAt = Date.now();
       const check = setInterval(() => {
-        if (!_versionFetching) {
+        if (!_versionFetching || Date.now() - startedAt > 20_000) {
           clearInterval(check);
           resolve(_cachedVersion);
         }
@@ -443,7 +682,7 @@ export function clearVersionCache(): void {
 }
 
 export function runHermesDoctor(): string {
-  if (!existsSync(HERMES_PYTHON) || !existsSync(HERMES_SCRIPT)) {
+  if (!canInvokeHermesCli()) {
     return "Hermes is not installed.";
   }
   try {
@@ -468,10 +707,35 @@ export function runHermesDoctor(): string {
 
 const OPENCLAW_DIR_NAMES = [".openclaw", ".clawdbot", ".moldbot"];
 
-export function checkOpenClawExists(): { found: boolean; path: string | null } {
+// hermes-desktop itself creates ~/.openclaw/claw3d/ as a stub when preparing
+// Claw3D settings (see claw3d.ts:writeClaw3dSettings), so a bare `existsSync`
+// check would surface that empty stub as a "real" OpenClaw install and
+// prompt the user to migrate from themselves. Require at least one regular
+// file anywhere in the tree so empty scaffolding doesn't trigger the banner.
+function dirContainsAnyFile(dir: string, maxDepth = 3): boolean {
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile()) return true;
+      if (entry.isDirectory() && maxDepth > 0) {
+        if (dirContainsAnyFile(join(dir, entry.name), maxDepth - 1)) {
+          return true;
+        }
+      }
+    }
+  } catch {
+    // unreadable → treat as empty
+  }
+  return false;
+}
+
+export function checkOpenClawExists(home: string = homedir()): {
+  found: boolean;
+  path: string | null;
+} {
   for (const name of OPENCLAW_DIR_NAMES) {
-    const dir = join(homedir(), name);
-    if (existsSync(dir)) {
+    const dir = join(home, name);
+    if (existsSync(dir) && dirContainsAnyFile(dir)) {
       return { found: true, path: dir };
     }
   }
@@ -554,8 +818,9 @@ export async function runHermesUpdate(
   function emit(text: string): void {
     log += text;
     onProgress({
-      step: 1,
-      totalSteps: 1,
+      operation: "update",
+      step: 0,
+      totalSteps: 0,
       title: "Updating Hermes Agent",
       detail: text.trim().slice(0, 120),
       log,
@@ -588,7 +853,7 @@ export async function runHermesUpdate(
 
     proc.on("close", (code) => {
       if (code === 0) {
-        emit("\nUpdate complete!\n");
+        emit("\nUpdate command finished.\n");
         resolve();
       } else {
         reject(new Error(`Update failed (exit code ${code}).`));
@@ -737,10 +1002,11 @@ export async function runInstall(
       // then run the official install script. Electron apps launched from Finder
       // don't inherit the terminal environment.
       const shellProfile = getShellProfile(home);
+
       const installCmd = [
         shellProfile ? `source "${shellProfile}" 2>/dev/null;` : "",
-        "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup",
-      ].join(" ");
+        verifiedInstallerCommand(),
+      ].join("\n");
 
       const basePath = getEnhancedPath();
       const proc = spawn("bash", ["-c", installCmd], {
@@ -765,6 +1031,14 @@ export async function runInstall(
       });
 
       proc.on("close", (code) => {
+        if (code === INSTALLER_VERIFICATION_FAILED) {
+          reject(
+            new Error(
+              "Installer download or checksum verification failed. Installation was not run.",
+            ),
+          );
+          return;
+        }
         if (code === 0) {
           emit("\nInstallation complete!\n");
           resolve();
@@ -778,11 +1052,8 @@ export async function runInstall(
             );
             resolve();
           } else {
-            reject(
-              new Error(
-                `Installation failed (exit code ${code}). You can try installing via terminal instead.`,
-              ),
-            );
+            const errorMessage = buildInstallErrorMessage(code);
+            reject(new Error(errorMessage));
           }
         }
       });
@@ -795,11 +1066,6 @@ export async function runInstall(
     askpass?.cleanup();
     sudoPrecache.stop();
   }
-}
-
-// PS single-quoted string escape: ' → ''
-function psQuote(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
 }
 
 // Resolve a powershell executable. Prefer PowerShell 7 (`pwsh`) when present,
@@ -838,23 +1104,22 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
   // The wrapper downloads install.ps1 to a sibling temp file and invokes it
   // with our parameters. This sidesteps the `iex`-can't-pass-args limitation.
   const wrapperScript = [
-    "$ErrorActionPreference = 'Stop'",
-    // Force TLS 1.2 for older Windows PowerShell 5.1 hosts that still default
-    // to TLS 1.0 — github raw refuses TLS < 1.2.
-    "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}",
-    "$url = 'https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1'",
-    `$installer = Join-Path $env:TEMP ("hermes-install-script-" + [guid]::NewGuid().ToString() + ".ps1")`,
-    // Windows PowerShell 5.1 parses BOM-less files as the legacy ANSI codepage,
-    // which mangles the non-ASCII glyphs in install.ps1 and produces parse
-    // errors (see issue #149). Re-save with a UTF-8 BOM so PS 5.1 reads it as
-    // UTF-8. Idempotent if upstream later adds its own BOM or switches to ASCII.
-    "$resp = Invoke-WebRequest -Uri $url -UseBasicParsing",
-    "$text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { [string]$resp.Content }",
-    "if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }",
-    "[System.IO.File]::WriteAllText($installer, $text, (New-Object System.Text.UTF8Encoding $true))",
-    `& $installer -SkipSetup -HermesHome ${psQuote(hermesHome)} -InstallDir ${psQuote(installDir)}`,
-    "$exit = $LASTEXITCODE",
-    "Remove-Item -Force -ErrorAction SilentlyContinue $installer",
+    verifiedWindowsInstallerScript(hermesHome, installDir),
+    "# Restore sandbox-only environment changes after verified installation.",
+    "try {",
+    "if ($env:HERMES_DESKTOP_SANDBOX -eq '1') {",
+    "    $sandboxVenv = Join-Path $installDir 'venv\\Scripts'",
+    "    $userHermesHome = [Environment]::GetEnvironmentVariable('HERMES_HOME', 'User')",
+    "    if ($userHermesHome -and ($userHermesHome.TrimEnd('\\') -ieq $hermesHome.TrimEnd('\\'))) {",
+    "      [Environment]::SetEnvironmentVariable('HERMES_HOME', $null, 'User')",
+    "    }",
+    "    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')",
+    "    if ($userPath) {",
+    "      $parts = $userPath -split ';' | Where-Object { $_ -and ($_.TrimEnd('\\') -ine $sandboxVenv.TrimEnd('\\')) }",
+    "      [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')",
+    "    }",
+    "}",
+    "} catch { [Console]::Error.WriteLine('Failed to restore sandbox environment: ' + $_.Exception.Message) }",
     "exit $exit",
     "",
   ].join("\r\n");
@@ -915,6 +1180,14 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
         resolve();
         return;
       }
+      if (code === INSTALLER_VERIFICATION_FAILED) {
+        reject(
+          new Error(
+            "Installer download or checksum verification failed. Installation was not run.",
+          ),
+        );
+        return;
+      }
       // Same tolerance as the bash path: if the binary tree exists, count it.
       if (existsSync(HERMES_PYTHON) && existsSync(HERMES_SCRIPT)) {
         emit(
@@ -922,11 +1195,7 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
         );
         resolve();
       } else {
-        reject(
-          new Error(
-            `Installation failed (exit code ${code}). Open PowerShell and try: irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex`,
-          ),
-        );
+        reject(new Error(buildInstallErrorMessage(code)));
       }
     });
 
@@ -1001,13 +1270,55 @@ export async function runHermesBackup(
 export async function runHermesImport(
   archivePath: string,
   profile?: string,
+  parentWindow?: BrowserWindow | null,
 ): Promise<{ success: boolean; error?: string }> {
+  if (getConnectionConfig().mode !== "local") {
+    return {
+      success: false,
+      error: "Backup import requires a Local connection.",
+    };
+  }
+  const archive = validateImportArchivePath(archivePath);
+  if (!archive.success) {
+    return { success: false, error: archive.error };
+  }
+
   if (!existsSync(HERMES_PYTHON) || !existsSync(HERMES_SCRIPT)) {
     return { success: false, error: "Hermes is not installed." };
   }
+  const targetProfile = profile || getActiveProfileNameSync();
+  if (!isValidProfileName(targetProfile)) {
+    return { success: false, error: PROFILE_NAME_ERROR };
+  }
+  const options: MessageBoxOptions = {
+    type: "warning",
+    title: "Restore Hermes backup",
+    message: "Restore this Hermes backup?",
+    detail: `Archive: ${basename(archive.path)}\nLocal profile: "${targetProfile}"\n\nThis replaces configuration, credentials, sessions and other backup contents. Provider backups may also restore files outside this profile.`,
+    buttons: ["Cancel", "Restore backup"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  };
+  try {
+    const result =
+      parentWindow && !parentWindow.isDestroyed()
+        ? await dialog.showMessageBox(parentWindow, options)
+        : await dialog.showMessageBox(options);
+    if (result.response !== 1) {
+      return { success: false, error: "Backup import cancelled." };
+    }
+  } catch {
+    return { success: false, error: "Could not confirm backup import." };
+  }
+  if (getConnectionConfig().mode !== "local") {
+    return {
+      success: false,
+      error: "Connection changed; backup import cancelled.",
+    };
+  }
   const args = hermesCliArgs();
-  if (profile && profile !== "default") args.push("-p", profile);
-  args.push("import", archivePath);
+  args.push("-p", targetProfile, "import", archive.path, "--force");
 
   return new Promise((resolve) => {
     execFile(
@@ -1025,11 +1336,11 @@ export async function runHermesImport(
         timeout: 120000,
         ...HIDDEN_SUBPROCESS_OPTIONS,
       },
-      (error, _stdout, stderr) => {
+      (error, stdout, stderr) => {
         if (error) {
           resolve({
             success: false,
-            error: stripAnsi(stderr || error.message).slice(0, 500),
+            error: stripAnsi(stderr || stdout || error.message).slice(0, 500),
           });
           return;
         }
@@ -1037,6 +1348,29 @@ export async function runHermesImport(
       },
     );
   });
+}
+
+export function validateImportArchivePath(
+  archivePath: unknown,
+): { success: true; path: string } | { success: false; error: string } {
+  if (typeof archivePath !== "string" || archivePath.trim() === "") {
+    return { success: false, error: "Import archive path is required." };
+  }
+
+  const path = resolve(archivePath);
+  if (!existsSync(path)) {
+    return { success: false, error: "Import archive does not exist." };
+  }
+
+  try {
+    if (!statSync(path).isFile()) {
+      return { success: false, error: "Import archive must be a file." };
+    }
+  } catch {
+    return { success: false, error: "Import archive is not readable." };
+  }
+
+  return { success: true, path };
 }
 
 // ────────────────────────────────────────────────────
@@ -1093,85 +1427,11 @@ export interface MemoryProviderInfo {
 export function discoverMemoryProviders(
   profile?: string,
 ): MemoryProviderInfo[] {
-  const pluginsDir = join(HERMES_REPO, "plugins", "memory");
-  if (!existsSync(pluginsDir)) return [];
-
-  const activeProvider = getActiveMemoryProvider(profile);
-
-  // Known providers with their metadata (from plugin.yaml files)
-  const KNOWN_PROVIDERS: Record<
-    string,
-    { description: string; envVars: string[]; pip?: string }
-  > = {
-    honcho: {
-      description: "memory.providers.honcho",
-      envVars: ["HONCHO_API_KEY"],
-      pip: "honcho-ai",
-    },
-    hindsight: {
-      description: "memory.providers.hindsight",
-      envVars: ["HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID"],
-      pip: "hindsight-client",
-    },
-    mem0: {
-      description: "memory.providers.mem0",
-      envVars: ["MEM0_API_KEY"],
-      pip: "mem0ai",
-    },
-    retaindb: {
-      description: "memory.providers.retaindb",
-      envVars: ["RETAINDB_API_KEY"],
-    },
-    supermemory: {
-      description: "memory.providers.supermemory",
-      envVars: ["SUPERMEMORY_API_KEY"],
-      pip: "supermemory",
-    },
-    holographic: {
-      description: "memory.providers.holographic",
-      envVars: [],
-    },
-    openviking: {
-      description: "memory.providers.openviking",
-      envVars: ["OPENVIKING_ENDPOINT", "OPENVIKING_API_KEY"],
-    },
-    byterover: {
-      description: "memory.providers.byterover",
-      envVars: ["BRV_API_KEY"],
-    },
-  };
-
-  const results: MemoryProviderInfo[] = [];
-
-  try {
-    const dirs = readdirSync(pluginsDir, { withFileTypes: true });
-    for (const d of dirs) {
-      if (!d.isDirectory() || d.name.startsWith("_")) continue;
-      const name = d.name;
-      const known = KNOWN_PROVIDERS[name];
-      const initFile = join(pluginsDir, name, "__init__.py");
-      const installed = existsSync(initFile);
-
-      results.push({
-        name,
-        description: known?.description || name,
-        installed,
-        active: name === activeProvider,
-        envVars: known?.envVars || [],
-      });
-    }
-  } catch {
-    /* non-fatal */
-  }
-
-  // Sort: active first, then installed, then alphabetical
-  results.sort((a, b) => {
-    if (a.active !== b.active) return a.active ? -1 : 1;
-    if (a.installed !== b.installed) return a.installed ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-
-  return results;
+  return discoverMemoryProviderDirectories(
+    join(HERMES_REPO, "plugins", "memory"),
+    profileHome(profile),
+    getActiveMemoryProvider(profile),
+  );
 }
 
 /**
@@ -1182,8 +1442,7 @@ export function getActiveMemoryProvider(profile?: string): string {
     const configPath = join(profileHome(profile), "config.yaml");
     if (!existsSync(configPath)) return "";
     const content = readFileSync(configPath, "utf-8");
-    const match = content.match(/^\s*provider:\s*["']?(\w+)["']?\s*$/m);
-    return match?.[1] || "";
+    return getYamlPath(content, "memory.provider") || "";
   } catch {
     return "";
   }

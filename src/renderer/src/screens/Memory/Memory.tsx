@@ -1,195 +1,213 @@
-import { useState, useEffect, useCallback } from "react";
-import { Plus, Trash, Refresh } from "../../assets/icons";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Refresh } from "../../assets/icons";
 import { useI18n } from "../../components/useI18n";
-import { Check, ExternalLink } from "lucide-react";
+import { OrbLoader } from "../../components/OrbLoader";
+import Soul from "../Soul/Soul";
+import { useProfileEditorTarget } from "../../hooks/useProfileEditorTarget";
+import {
+  beginProfileMemoryMutation,
+  profileMemoryRevision,
+  waitForProfileMemoryMutations,
+} from "../../hooks/useProfileEditorLifetime";
+import type { ProfileEditorTarget } from "../../../../shared/profile-editor-target";
+import { CapacityCards } from "./CapacityCards";
+import { MemoryTabs } from "./MemoryTabs";
+import { MemoryEntries } from "./MemoryEntries";
+import { MemoryProfile } from "./MemoryProfile";
+import { MemoryProviders } from "./MemoryProviders";
+import type { MemoryData, MemoryProviderInfo, MemoryTab } from "./types";
 
-interface MemoryEntry {
-  index: number;
-  content: string;
-}
-
-interface MemoryData {
-  memory: {
-    content: string;
-    exists: boolean;
-    lastModified: number | null;
-    entries: MemoryEntry[];
-    charCount: number;
-    charLimit: number;
-  };
-  user: {
-    content: string;
-    exists: boolean;
-    lastModified: number | null;
-    charCount: number;
-    charLimit: number;
-  };
-  stats: { totalSessions: number; totalMessages: number };
-}
-
-function timeAgo(ts: number | null): string {
-  if (!ts) return "";
-  const diff = Math.floor(Date.now() / 1000) - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
-
-function CapacityBar({
-  used,
-  limit,
-  label,
+function Memory({
+  profile,
+  readOnly = false,
 }: {
-  used: number;
-  limit: number;
-  label: string;
+  profile?: string;
+  readOnly?: boolean;
 }): React.JSX.Element {
-  const pct = Math.min(100, Math.round((used / limit) * 100));
-  const color =
-    pct > 90 ? "var(--error)" : pct > 70 ? "var(--warning)" : "var(--success)";
+  const scope = useProfileEditorTarget(profile);
+  if (!scope.target)
+    return scope.error ? (
+      <div role="alert">{scope.error}</div>
+    ) : (
+      <OrbLoader state="searching" size={64} />
+    );
   return (
-    <div className="memory-capacity">
-      <div className="memory-capacity-header">
-        <span className="memory-capacity-label">{label}</span>
-        <span className="memory-capacity-value">
-          {used.toLocaleString()} / {limit.toLocaleString()} chars ({pct}%)
-        </span>
-      </div>
-      <div className="memory-capacity-track">
-        <div
-          className="memory-capacity-fill"
-          style={{ width: `${pct}%`, background: color }}
-        />
-      </div>
-    </div>
+    <MemoryEditor
+      key={`${scope.target.scopeToken}:${scope.revision}:${readOnly}`}
+      target={scope.target}
+      isCurrent={scope.isCurrent}
+      readOnly={readOnly || scope.target.mode === "remote"}
+    />
   );
 }
 
-interface MemoryProviderInfo {
-  name: string;
-  description: string;
-  installed: boolean;
-  active: boolean;
-  envVars: string[];
-}
-
-const PROVIDER_URLS: Record<string, string> = {
-  honcho: "https://app.honcho.dev",
-  hindsight: "https://ui.hindsight.vectorize.io",
-  mem0: "https://app.mem0.ai",
-  retaindb: "https://retaindb.com",
-  supermemory: "https://supermemory.ai",
-  byterover: "https://app.byterover.dev",
-};
-
-function Memory({ profile }: { profile?: string }): React.JSX.Element {
+function MemoryEditor({
+  target,
+  isCurrent,
+  readOnly,
+}: {
+  target: ProfileEditorTarget;
+  isCurrent: (target: ProfileEditorTarget) => boolean;
+  readOnly: boolean;
+}): React.JSX.Element {
+  const profile = target.profile;
   const { t } = useI18n();
   const [data, setData] = useState<MemoryData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<"entries" | "profile" | "providers">(
-    "entries",
-  );
+  const [tab, setTab] = useState<MemoryTab>("entries");
   const [error, setError] = useState("");
   const [memoryProvider, setMemoryProvider] = useState<string | null>(null);
   const [providers, setProviders] = useState<MemoryProviderInfo[]>([]);
-  const [providerEnv, setProviderEnv] = useState<Record<string, string>>({});
-  const [providerSavedKey, setProviderSavedKey] = useState<string | null>(null);
-  const [activating, setActivating] = useState<string | null>(null);
+  const [providerError, setProviderError] = useState("");
+  const [dataRevision, setDataRevision] = useState(0);
+  const [writing, setWriting] = useState(false);
+  const pendingWrites = useRef(0);
+  const refreshAfterWrite = useRef(false);
+  const loadingRef = useRef(loading);
+  const snapshotValid = useRef(false);
+  const snapshotRevision = useRef(-1);
+  loadingRef.current = loading;
 
-  // Entry management
-  const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  const [editContent, setEditContent] = useState("");
-  const [showAdd, setShowAdd] = useState(false);
-  const [newEntry, setNewEntry] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
-
-  // User profile editing
-  const [userContent, setUserContent] = useState("");
-  const [userEditing, setUserEditing] = useState(false);
-  const [userSaved, setUserSaved] = useState(false);
-
+  const mounted = useRef(true);
+  const generation = useRef(0);
+  const live = useCallback(
+    () => mounted.current && isCurrent(target),
+    [target, isCurrent],
+  );
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      generation.current += 1;
+    };
+  }, []);
   const loadData = useCallback(async () => {
-    const [d, provider, provs, env] = await Promise.all([
-      window.hermesAPI.readMemory(profile),
-      window.hermesAPI.getConfig("memory.provider", profile),
-      window.hermesAPI.discoverMemoryProviders(profile),
-      window.hermesAPI.getEnv(profile),
-    ]);
-    setData(d as MemoryData);
-    setUserContent(d.user.content);
-    setMemoryProvider(provider);
-    setProviders(provs);
-    setProviderEnv(env);
-    setLoading(false);
-  }, [profile]);
+    if (!live()) return;
+    if (pendingWrites.current) {
+      refreshAfterWrite.current = true;
+      return;
+    }
+    const request = ++generation.current;
+    snapshotValid.current = false;
+    loadingRef.current = true;
+    setLoading(true);
+    setError("");
+    setProviderError("");
+    try {
+      const revision = await waitForProfileMemoryMutations(target);
+      if (!live() || request !== generation.current) return;
+      if (profileMemoryRevision(target) !== revision) {
+        void loadData();
+        return;
+      }
+      const [d, provider, provs] = await Promise.all([
+        window.hermesAPI.readMemory(profile, target),
+        window.hermesAPI.getConfig("memory.provider", profile, target),
+        // Discovery can be unavailable even when SSH file/config reads work.
+        // Keep that capability failure confined to the Providers tab.
+        window.hermesAPI.discoverMemoryProviders(profile, target).then(
+          (providers) => ({ providers, error: "" }),
+          (err: unknown) => ({
+            providers: [],
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        ),
+      ]);
+      if (!live() || request !== generation.current) return;
+      if (profileMemoryRevision(target) !== revision) {
+        void loadData();
+        return;
+      }
+      snapshotRevision.current = revision;
+      snapshotValid.current = true;
+      setData(d as MemoryData);
+      setMemoryProvider(provider);
+      setProviders(provs.providers);
+      setProviderError(provs.error);
+      // Entry positions and the other tabs' initial state belong to this read.
+      // Reset them together; Soul has an independent lifetime and autosave.
+      setDataRevision((revision) => revision + 1);
+    } catch (err) {
+      // A remote read can reject (offline server, sign-in expired). Say so and
+      // leave the refresh button usable instead of spinning forever.
+      if (live() && request === generation.current)
+        setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (live() && request === generation.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
+    }
+  }, [profile, target, live]);
+
+  const beginMutation = (): (() => void) | null => {
+    if (
+      !live() ||
+      !snapshotValid.current ||
+      loadingRef.current ||
+      pendingWrites.current
+    )
+      return null;
+    const finishScope = beginProfileMemoryMutation(
+      target,
+      snapshotRevision.current,
+    );
+    if (!finishScope) {
+      void loadData();
+      return null;
+    }
+    pendingWrites.current += 1;
+    setWriting(true);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      finishScope();
+      pendingWrites.current -= 1;
+      if (!live()) return;
+      setWriting(false);
+      if (refreshAfterWrite.current) {
+        refreshAfterWrite.current = false;
+        void loadData();
+      } else snapshotRevision.current = profileMemoryRevision(target);
+    };
+  };
 
   useEffect(() => {
+    // A different profile: drop the previous one's data NOW. If this load fails,
+    // the old entries would otherwise stay on screen under the new profile name
+    // and an edit or delete would hit the wrong profile's memory.
+    setData(null);
     setLoading(true);
     loadData();
   }, [loadData]);
 
-  async function handleAddEntry(): Promise<void> {
-    if (!newEntry.trim()) return;
-    setError("");
-    const result = await window.hermesAPI.addMemoryEntry(
-      newEntry.trim(),
-      profile,
+  if (!loading && !data) {
+    return (
+      <div className="settings-container">
+        <h1 className="settings-header">{t("memory.title")}</h1>
+        <div className="memory-error" role="alert">
+          {error}
+        </div>
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={() => {
+            setLoading(true);
+            void loadData();
+          }}
+        >
+          <Refresh size={13} />
+        </button>
+      </div>
     );
-    if (result.success) {
-      setNewEntry("");
-      setShowAdd(false);
-      await loadData();
-    } else {
-      setError(result.error || t("memory.addFailed"));
-    }
   }
 
-  async function handleSaveEdit(): Promise<void> {
-    if (editingIndex === null) return;
-    setError("");
-    const result = await window.hermesAPI.updateMemoryEntry(
-      editingIndex,
-      editContent.trim(),
-      profile,
-    );
-    if (result.success) {
-      setEditingIndex(null);
-      setEditContent("");
-      await loadData();
-    } else {
-      setError(result.error || t("memory.updateFailed"));
-    }
-  }
-
-  async function handleDeleteEntry(index: number): Promise<void> {
-    await window.hermesAPI.removeMemoryEntry(index, profile);
-    setConfirmDelete(null);
-    await loadData();
-  }
-
-  async function handleSaveUserProfile(): Promise<void> {
-    setError("");
-    const result = await window.hermesAPI.writeUserProfile(
-      userContent,
-      profile,
-    );
-    if (result.success) {
-      setUserEditing(false);
-      setUserSaved(true);
-      setTimeout(() => setUserSaved(false), 2000);
-      await loadData();
-    } else {
-      setError(result.error || t("memory.saveFailed"));
-    }
-  }
-
-  if (loading || !data) {
+  if (!data) {
     return (
       <div className="settings-container">
         <h1 className="settings-header">{t("memory.title")}</h1>
         <div style={{ display: "flex", justifyContent: "center", padding: 48 }}>
-          <div className="loading-spinner" />
+          <OrbLoader state="searching" size={64} />
         </div>
       </div>
     );
@@ -204,412 +222,89 @@ function Memory({ profile }: { profile?: string }): React.JSX.Element {
           </h1>
           <p className="memory-subtitle">{t("memory.subtitle")}</p>
         </div>
-        <button className="btn btn-secondary btn-sm" onClick={loadData}>
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={loadData}
+          disabled={loading || writing}
+        >
           <Refresh size={13} />
         </button>
       </div>
 
-      {/* Stats */}
-      <div className="memory-stats">
-        <div className="memory-stat">
-          <span className="memory-stat-value">{data.stats.totalSessions}</span>
-          <span className="memory-stat-label">{t("memory.sessions")}</span>
-        </div>
-        <div className="memory-stat">
-          <span className="memory-stat-value">{data.stats.totalMessages}</span>
-          <span className="memory-stat-label">{t("memory.messages")}</span>
-        </div>
-        <div className="memory-stat">
-          <span className="memory-stat-value">
-            {data.memory.entries.length}
-          </span>
-          <span className="memory-stat-label">{t("memory.memories")}</span>
-        </div>
-      </div>
+      <CapacityCards data={data} />
+      <MemoryTabs activeTab={tab} onTabChange={setTab} disabled={writing} />
 
-      {/* Capacity */}
-      <div className="memory-capacities">
-        <CapacityBar
-          used={data.memory.charCount}
-          limit={data.memory.charLimit}
-          label={t("memory.agentMemory")}
-        />
-        <CapacityBar
-          used={data.user.charCount}
-          limit={data.user.charLimit}
-          label={t("memory.userProfile")}
-        />
-      </div>
-
-      {/* Tabs */}
-      <div className="memory-tabs">
-        <button
-          className={`memory-tab ${tab === "entries" ? "active" : ""}`}
-          onClick={() => setTab("entries")}
-        >
-          {t("memory.agentMemory")}
-          {data.memory.lastModified && (
-            <span className="memory-tab-time">
-              {timeAgo(data.memory.lastModified)}
-            </span>
-          )}
-        </button>
-        <button
-          className={`memory-tab ${tab === "profile" ? "active" : ""}`}
-          onClick={() => setTab("profile")}
-        >
-          {t("memory.userProfile")}
-          {data.user.lastModified && (
-            <span className="memory-tab-time">
-              {timeAgo(data.user.lastModified)}
-            </span>
-          )}
-        </button>
-        <button
-          className={`memory-tab ${tab === "providers" ? "active" : ""}`}
-          onClick={() => setTab("providers")}
-        >
-          {t("memory.providersTitle")}
-          {memoryProvider && (
-            <span className="memory-tab-time">{memoryProvider}</span>
-          )}
-        </button>
-      </div>
-
-      {error && <div className="memory-error">{error}</div>}
-
-      {/* Agent Memory Entries */}
-      {tab === "entries" && (
-        <div className="memory-entries">
-          <div className="memory-entries-header">
-            <span className="memory-entries-count">
-              {t("memory.entries", { count: data.memory.entries.length })}
-            </span>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => setShowAdd(!showAdd)}
-            >
-              <Plus size={13} />
-              {t("memory.addMemory")}
-            </button>
-          </div>
-
-          {showAdd && (
-            <div className="memory-entry-form">
-              <textarea
-                className="memory-entry-textarea"
-                value={newEntry}
-                onChange={(e) => setNewEntry(e.target.value)}
-                placeholder={t("memory.entriesPlaceholder")}
-                rows={3}
-                autoFocus
-              />
-              <div className="memory-entry-form-actions">
-                <span className="memory-entry-chars">
-                  {newEntry.length} chars
-                </span>
-                <button
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => {
-                    setShowAdd(false);
-                    setNewEntry("");
-                  }}
-                >
-                  Cancel
-                </button>
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={handleAddEntry}
-                  disabled={!newEntry.trim()}
-                >
-                  Save
-                </button>
-              </div>
-            </div>
-          )}
-
-          {data.memory.entries.length === 0 ? (
-            <div className="memory-empty">
-              <p>{t("memory.noMemoriesYet")}</p>
-              <p className="memory-empty-hint">{t("memory.addManuallyHint")}</p>
-            </div>
-          ) : (
-            data.memory.entries.map((entry) => (
-              <div key={entry.index} className="memory-entry-card">
-                {editingIndex === entry.index ? (
-                  <div className="memory-entry-form">
-                    <textarea
-                      className="memory-entry-textarea"
-                      value={editContent}
-                      onChange={(e) => setEditContent(e.target.value)}
-                      rows={3}
-                      autoFocus
-                    />
-                    <div className="memory-entry-form-actions">
-                      <span className="memory-entry-chars">
-                        {t("memory.chars", { count: editContent.length })}
-                      </span>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => setEditingIndex(null)}
-                      >
-                        {t("memory.cancel")}
-                      </button>
-                      <button
-                        className="btn btn-primary btn-sm"
-                        onClick={handleSaveEdit}
-                      >
-                        {t("memory.save")}
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="memory-entry-content">{entry.content}</div>
-                    <div className="memory-entry-actions">
-                      <button
-                        className="btn-ghost memory-entry-btn"
-                        onClick={() => {
-                          setEditingIndex(entry.index);
-                          setEditContent(entry.content);
-                        }}
-                      >
-                        {t("memory.edit")}
-                      </button>
-                      {confirmDelete === entry.index ? (
-                        <span className="memory-entry-confirm">
-                          {t("memory.deleteConfirm")}
-                          <button
-                            className="btn-ghost"
-                            style={{ color: "var(--error)" }}
-                            onClick={() => handleDeleteEntry(entry.index)}
-                          >
-                            {t("memory.yes")}
-                          </button>
-                          <button
-                            className="btn-ghost"
-                            onClick={() => setConfirmDelete(null)}
-                          >
-                            {t("memory.no")}
-                          </button>
-                        </span>
-                      ) : (
-                        <button
-                          className="btn-ghost memory-entry-btn"
-                          onClick={() => setConfirmDelete(entry.index)}
-                        >
-                          <Trash size={13} />
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            ))
-          )}
+      {error && (
+        <div className="memory-error" role="alert">
+          {error}
         </div>
       )}
 
-      {/* User Profile */}
-      {tab === "profile" && (
-        <div className="memory-profile">
-          <div className="memory-profile-header">
-            <span className="memory-profile-hint">
-              {t("memory.userProfileHint")}
-            </span>
-            {userSaved && (
-              <span
-                style={{
-                  color: "var(--success)",
-                  fontSize: 12,
-                  fontWeight: 600,
-                }}
-              >
-                {t("common.saved")}
-              </span>
-            )}
-          </div>
-          <textarea
-            className="memory-profile-textarea"
-            value={userContent}
-            onChange={(e) => {
-              setUserContent(e.target.value);
-              setUserEditing(true);
-            }}
-            placeholder={t("memory.userProfilePlaceholder")}
-            rows={8}
+      {readOnly && tab !== "soul" && (
+        <div className="memory-error" role="note">
+          {data.contentUnavailable
+            ? "Connected to a remote Hermes server: its API does not expose the contents of MEMORY.md / USER.md, so only profile configuration and providers are shown. View or edit them on the server."
+            : "Connected to a remote Hermes server: memory is shown read-only here. Edit it on the server (or via chat)."}
+        </div>
+      )}
+
+      {/* A disabled fieldset natively disables every button/input inside it. */}
+      <fieldset
+        key={dataRevision}
+        disabled={readOnly || loading || writing || !!error}
+        style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
+      >
+        {tab === "entries" && !data.contentUnavailable && (
+          <MemoryEntries
+            entries={data.memory.entries}
+            profile={profile}
+            target={target}
+            isCurrent={isCurrent}
+            onRefresh={loadData}
+            onMutationStart={beginMutation}
           />
-          <div className="memory-profile-footer">
-            <span className="memory-entry-chars">
-              {t("memory.chars", { count: userContent.length })} /{" "}
-              {data.user.charLimit}{" "}
-              {t("memory.chars", { count: 1 }).split(" ")[1]}
-            </span>
-            {userEditing && (
-              <button
-                className="btn btn-primary btn-sm"
-                onClick={handleSaveUserProfile}
-              >
-                {t("memory.saveProfile")}
-              </button>
+        )}
+
+        {tab === "profile" && !data.contentUnavailable && (
+          <MemoryProfile
+            content={data.user.content}
+            charLimit={data.user.charLimit}
+            profile={profile}
+            target={target}
+            isCurrent={isCurrent}
+            onRefresh={loadData}
+            onMutationStart={beginMutation}
+          />
+        )}
+
+        {tab === "providers" && providerError && (
+          <div className="memory-error" role="alert">
+            <p>{t("memory.providerDiscoveryUnavailable")}</p>
+            <p>{providerError}</p>
+            {memoryProvider && (
+              <p>
+                {t("memory.configuredProvider")}: <code>{memoryProvider}</code>
+              </p>
             )}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Memory Providers */}
-      {tab === "providers" && (
-        <div className="memory-providers">
-          <div className="memory-providers-hint">
-            {t("memory.providersHint")}
-            {memoryProvider ? (
-              <span
-                dangerouslySetInnerHTML={{
-                  __html: t("memory.providersHintActive", {
-                    provider: memoryProvider,
-                  }),
-                }}
-              />
-            ) : (
-              <span> {t("memory.providersHintInactive")}</span>
-            )}
-          </div>
+        {tab === "providers" && !providerError && (
+          <MemoryProviders
+            providers={providers}
+            activeProvider={memoryProvider}
+            profile={profile}
+            target={target}
+            isCurrent={isCurrent}
+            onRefresh={loadData}
+            onMutationStart={beginMutation}
+          />
+        )}
+      </fieldset>
 
-          {providers.length === 0 ? (
-            <div className="memory-empty">
-              <p>{t("memory.noProvidersFound")}</p>
-            </div>
-          ) : (
-            <div className="memory-providers-grid">
-              {providers.map((p) => (
-                <div
-                  key={p.name}
-                  className={`memory-provider-card ${p.active ? "memory-provider-active" : ""}`}
-                >
-                  <div className="memory-provider-header">
-                    <div className="memory-provider-name">
-                      {p.name}
-                      {p.active && (
-                        <span className="memory-provider-badge">
-                          <Check size={10} /> {t("memory.active")}
-                        </span>
-                      )}
-                    </div>
-                    {PROVIDER_URLS[p.name] && (
-                      <button
-                        className="btn-ghost"
-                        style={{ padding: 2, opacity: 0.6 }}
-                        onClick={() =>
-                          window.hermesAPI.openExternal(PROVIDER_URLS[p.name])
-                        }
-                        title={t("memory.openProviderWebsite")}
-                      >
-                        <ExternalLink size={12} />
-                      </button>
-                    )}
-                  </div>
-                  <div className="memory-provider-desc">{t(p.description)}</div>
-
-                  {/* Env var config fields */}
-                  {p.envVars.length > 0 && (
-                    <div className="memory-provider-fields">
-                      {p.envVars.map((envKey) => (
-                        <div key={envKey} className="memory-provider-field">
-                          <label className="memory-provider-field-label">
-                            {envKey}
-                            {providerSavedKey === envKey && (
-                              <span
-                                style={{
-                                  color: "var(--success)",
-                                  fontSize: 10,
-                                  marginLeft: 6,
-                                }}
-                              >
-                                {t("common.saved")}
-                              </span>
-                            )}
-                          </label>
-                          <input
-                            className="input"
-                            type="password"
-                            value={providerEnv[envKey] || ""}
-                            onChange={(e) =>
-                              setProviderEnv((prev) => ({
-                                ...prev,
-                                [envKey]: e.target.value,
-                              }))
-                            }
-                            onBlur={async () => {
-                              await window.hermesAPI.setEnv(
-                                envKey,
-                                providerEnv[envKey] || "",
-                                profile,
-                              );
-                              setProviderSavedKey(envKey);
-                              setTimeout(() => setProviderSavedKey(null), 2000);
-                            }}
-                            placeholder={t("memory.enterEnvKey", {
-                              key: envKey,
-                            })}
-                            style={{ fontSize: 12 }}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  <div className="memory-provider-actions">
-                    {p.active ? (
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={async () => {
-                          setActivating(p.name);
-                          await window.hermesAPI.setConfig(
-                            "memory.provider",
-                            "",
-                            profile,
-                          );
-                          setMemoryProvider(null);
-                          setProviders((prev) =>
-                            prev.map((pr) => ({ ...pr, active: false })),
-                          );
-                          setActivating(null);
-                        }}
-                        disabled={activating !== null}
-                      >
-                        {t("memory.deactivate")}
-                      </button>
-                    ) : (
-                      <button
-                        className="btn btn-primary btn-sm"
-                        onClick={async () => {
-                          setActivating(p.name);
-                          await window.hermesAPI.setConfig(
-                            "memory.provider",
-                            p.name,
-                            profile,
-                          );
-                          setMemoryProvider(p.name);
-                          setProviders((prev) =>
-                            prev.map((pr) => ({
-                              ...pr,
-                              active: pr.name === p.name,
-                            })),
-                          );
-                          setActivating(null);
-                        }}
-                        disabled={activating !== null}
-                      >
-                        {activating === p.name
-                          ? t("memory.activating")
-                          : t("memory.activate")}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+      {tab === "soul" && (
+        <div className="memory-soul-tab">
+          <Soul profile={profile} allowReset={!readOnly} />
         </div>
       )}
     </div>

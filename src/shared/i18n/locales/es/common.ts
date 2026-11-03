@@ -1,5 +1,5 @@
 export default {
-  appName: "Hermes Agent",
+  appName: "Hermes One",
   continue: "Continuar",
   cancel: "Cancelar",
   retry: "Reintentar",
@@ -16,6 +16,7 @@ export default {
   add: "Agregar",
   create: "Crear",
   close: "Cerrar",
+  dismiss: "Descartar",
   confirm: "Confirmar",
   reset: "Restablecer",
   back: "Atrás",
@@ -40,6 +41,8 @@ export default {
   devOnly: "Solo para desarrolladores",
   updateAvailable: "Actualizar a v{{version}}",
   downloading: "Descargando {{percent}}%",
+  downloadingUnknown: "Descargando...",
+  waitingForDownloadProgress: "Esperando el progreso de la descarga...",
   restartToUpdate: "Reiniciar para actualizar",
   updateFailed: "Error al actualizar",
   errorTitle: "Algo salió mal",
